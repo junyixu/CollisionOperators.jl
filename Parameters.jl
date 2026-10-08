@@ -97,16 +97,22 @@ Base.@kwdef struct SimParameters
     # order in ‖F‖; 3–10x worse energy drift in the FP32 A/B). Keep true.
     exit_picard_step::Bool = true
 
-    # Warm start for the implicit solve: :euler = explicit Euler predictor
-    # (default, current behavior); :nn = Euler + Δt²·δ̂ MLP correction loaded
-    # from `nn_weights` (see warmstart_nn.jl).
+    # Initial guess of the implicit solve (warmstart.jl): :euler = explicit Euler
+    # predictor; :nn = Euler + Δt²·δ̂ from the MLP in `nn_weights`, each particle's
+    # correction clipped to `nn_cap` × the mean Euler step ‖Δt·v̇‖.
     warmstart::Symbol = :euler
     nn_weights::String = ""
+    nn_cap::Float64 = 3.0
 
-    # Stream per-step training data (v, v̇, G, L_vec) to
-    # training_dump_<suffix>.bin (~1 MB/step at N=40k). Consumed by
-    # probe_delta_predictability.jl / train_warmstart.jl.
+    # Append each step's pre-solve state and NN label to
+    # training_dump_<suffix>.bin (1.3 MB/step at N=40k) for train_warmstart.jl.
     dump_training::Bool = false
+
+    # Oracle sweep: every `oracle_every` steps (0 = off), re-solve the step from
+    # starts that leave a fraction ε ∈ `oracle_eps` of the Euler gap, logging the
+    # iterations to oracle_<suffix>.csv. Costs one extra solve per ε and mode.
+    oracle_every::Int = 0
+    oracle_eps::String = "1,0.3,0.1,0.03,0.01,0.001,0"
 
     # `v1_peak == 0` → single anisotropic Gaussian N(0, diag(σ1², σ2²)).
     # `v1_peak  > 0` → bimodal in v₁: balanced 50/50 mixture of

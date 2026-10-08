@@ -8,6 +8,8 @@ if "core" in GROUPS
     @safetestset "io.jl helpers" include("integration/io_helpers.jl")
     # newton_krylov.jl is generic over plain vectors, so it runs here too.
     @safetestset "GMRES / Newton–Krylov" include("integration/newton_krylov.jl")
+    # warmstart.jl is stdlib-only as well.
+    @safetestset "NN warm start" include("integration/warmstart.jl")
 end
 
 # main.jl is a script that pulls CairoMakie and Mantis, so the kernels reachable

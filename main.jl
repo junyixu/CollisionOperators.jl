@@ -29,7 +29,7 @@ using LinearAlgebra: ldiv!
 include("io.jl")       # rclone mirror, params record, checkpoints, cons CSV
 include("solver.jl")   # Picard map + Anderson solve, CPU/GPU hot-loop hooks
 include("plots.jl")    # fs_snapshot CSV + diagnostics PNGs
-include("warmstart_nn.jl")  # NN warmstart model training data I/O + inference
+include("warmstart.jl")   # NN warm start, training dump, oracle sweep
 
 function run_simulation(p::SimParameters; resume = nothing)
     print_summary(p)
@@ -150,15 +150,37 @@ function run_simulation(p::SimParameters; resume = nothing)
          nothing
     nk_fd_h = p.nk_fd_h > 0 ? p.nk_fd_h : (p.use_gpu && p.gpu_fp32 ? 1e-5 : 1e-6)
 
-    # NN warm start (stateless — resume-safe without checkpoint changes).
+    # Warm start (stateless, so a resume needs nothing from the checkpoint).
     p.warmstart in (:euler, :nn) || error("unknown warmstart=$(p.warmstart)")
-    nn_model = p.warmstart === :nn ? load_warmstart_model(p.nn_weights) : nothing
+    nn = p.warmstart === :nn ?
+         NNWarmstart(load_warmstart_model(p.nn_weights), p.N_PARTICLES;
+        cap = p.nn_cap, to_device = NN_TO_DEVICE[]) : nothing
+    nn === nothing || println("NN warm start: $(p.nn_weights)  " *
+                              "$(nn.model.info)")
+    v_euler = similar(v_particles)   # the Euler predictor, kept for the label / oracle
 
-    # Per-step training dump for the NN warm-start pipeline (crash-safe append).
+    # Training dump: v̇ and G are scratch inside the solve, so stage them first.
+    dump_file = "training_dump_$(p.suffix).bin"
     dump_io = p.dump_training ?
-              open_training_dump("training_dump_$(p.suffix).bin",
-        p.N_PARTICLES, ws.n_dofs, p.DT;
-        append = (start_step > 0)) : nothing
+              open_training_dump(dump_file, ws.bp1, ws.bp2, w_particles;
+        resume_step = start_step > 0 ? start_step : nothing) : nothing
+    dump_dotv = p.dump_training ? similar(dot_v) : dot_v
+    dump_G = p.dump_training ? similar(G) : G
+
+    oracle_eps = parse_oracle_eps(p.oracle_eps)
+    oracle_csv = "oracle_$(p.suffix).csv"
+    oracle_io = if p.oracle_every <= 0
+        nothing
+    elseif start_step > 0 && isfile(oracle_csv)
+        truncate_csv_after(oracle_csv, start_step)
+        open(oracle_csv, "a")
+    else
+        io = open(oracle_csv, "w")
+        println(io, "step,mode,eps,iter,r0,residual")
+        io
+    end
+    v_star = p.oracle_every > 0 ? similar(v_particles) : v_particles
+    v_try = p.oracle_every > 0 ? similar(v_particles) : v_particles
 
     # Snapshot every 25 steps (plus final step if not already a multiple of 25).
     # Crash-safe: conservation + particles appended per-step / per-snapshot so a
@@ -220,43 +242,67 @@ function run_simulation(p::SimParameters; resume = nothing)
             Base.invokelatest(COMPG_FN[], ws, G, v_particles, L_vec)
             Base.invokelatest(COLLISION_FN[], ws, dot_v, v_particles, w_particles, G)
         end
-        @. v1 = v_particles + p.DT * dot_v
-
-        # Dump the pure pre-solve state (before any NN correction): the δ
-        # label is reconstructed offline from the next record's v.
-        dump_io !== nothing &&
-            write_dump_record(dump_io, step, v_particles, dot_v, G, L_vec)
-
-        nn_model !== nothing &&
-            nn_warmstart_correct!(v1, nn_model, v_particles, dot_v, G,
+        @. v_euler = v_particles + p.DT * dot_v
+        v1 .= v_euler
+        if dump_io !== nothing
+            dump_dotv .= dot_v
+            dump_G .= G
+        end
+        if nn !== nothing
+            t_nn = @elapsed n_clip = nn_correct!(v1, nn, v_particles, dot_v, G,
                 w_particles, ws.bp1, ws.bp2, p.DT)
+            (step <= start_step + 3 || step % 25 == 0) &&
+                println("  nn: $(round(1e3 * t_nn; digits = 1)) ms, clipped $n_clip")
+        end
 
-        iter, res_final, n_rs, r0_init = if nk === nothing
-            step_anderson!(ws,
-                v1, v_particles, w_particles, S0, p.DT,
-                v_mid, dv, dS_mid, G_eff, dot_v, f_buf,
-                r_vec, L_vec, G,
-                Gv, r_curr, r_prev, Gv_prev, v_old_buf, ΔF, ΔG;
-                m = p.m_anderson, max_iter = p.max_iter, tol = p.tol,
-                abs_floor = p.abs_floor,
-                stag_window = p.stag_window,
-                stag_rel_tol = p.stag_rel_tol,
-                damp_decay_start = p.damp_decay_start,
-                damp_decay_factor = p.damp_decay_factor,
-                damping = p.damping, use_anderson = p.use_anderson,
-                use_gonzalez = p.use_gonzalez,
-                exit_picard_step = p.exit_picard_step,
-                verbose = (step <= start_step + 3))
-        else
-            step_newton!(ws,
-                v1, v_particles, w_particles, S0, p.DT,
-                v_mid, dv, dS_mid, G_eff, dot_v, f_buf,
-                r_vec, L_vec, G, Gv, nk;
-                max_iter = p.max_iter, tol = p.tol, abs_floor = p.abs_floor,
-                fd_h = nk_fd_h, fd_rel = p.nk_fd_rel, eta_max = p.nk_eta_max,
-                use_gonzalez = p.use_gonzalez,
-                exit_picard_step = p.exit_picard_step,
-                verbose = (step <= start_step + 3))
+        # One implicit step from the guess in `v`, which leaves holding the root.
+        implicit_solve!(v; verbose = false) =
+            if nk === nothing
+                step_anderson!(ws,
+                    v, v_particles, w_particles, S0, p.DT,
+                    v_mid, dv, dS_mid, G_eff, dot_v, f_buf,
+                    r_vec, L_vec, G,
+                    Gv, r_curr, r_prev, Gv_prev, v_old_buf, ΔF, ΔG;
+                    m = p.m_anderson, max_iter = p.max_iter, tol = p.tol,
+                    abs_floor = p.abs_floor,
+                    stag_window = p.stag_window,
+                    stag_rel_tol = p.stag_rel_tol,
+                    damp_decay_start = p.damp_decay_start,
+                    damp_decay_factor = p.damp_decay_factor,
+                    damping = p.damping, use_anderson = p.use_anderson,
+                    use_gonzalez = p.use_gonzalez,
+                    exit_picard_step = p.exit_picard_step,
+                    verbose)
+            else
+                step_newton!(ws,
+                    v, v_particles, w_particles, S0, p.DT,
+                    v_mid, dv, dS_mid, G_eff, dot_v, f_buf,
+                    r_vec, L_vec, G, Gv, nk;
+                    max_iter = p.max_iter, tol = p.tol, abs_floor = p.abs_floor,
+                    fd_h = nk_fd_h, fd_rel = p.nk_fd_rel, eta_max = p.nk_eta_max,
+                    use_gonzalez = p.use_gonzalez,
+                    exit_picard_step = p.exit_picard_step,
+                    verbose)
+            end
+        iter, res_final, n_rs, r0_init = implicit_solve!(v1;
+            verbose = (step <= start_step + 3))
+
+        dump_io !== nothing &&
+            write_dump_record(dump_io, step, p.DT, iter, r0_init,
+                v_particles, dump_dotv, dump_G, v1, v_euler)
+
+        # Oracle: restart from v* plus a fraction ε of the Euler gap. Scale ε = 1
+        # is the Euler start again, so its row should repeat `iter`.
+        if oracle_io !== nothing && step % p.oracle_every == 0
+            v_star .= v1
+            rng = Random.Xoshiro(step)   # not the global RNG: that one is checkpointed
+            for mode in (:scale, :noise), ε in oracle_eps
+                mode === :noise && ε == 0 && continue
+                oracle_start!(v_try, v_star, v_euler, ε, mode, rng)
+                it, res, _, r0 = implicit_solve!(v_try)
+                println(oracle_io, "$step,$mode,$ε,$it,$r0,$res")
+            end
+            flush(oracle_io)
         end
         v_particles .= v1
 
@@ -304,6 +350,7 @@ function run_simulation(p::SimParameters; resume = nothing)
             # Mirror the growing conservation CSV at snapshot cadence (not every
             # step — that would spawn an rclone process per timestep).
             rclone_upload(p.suffix, cons_csv)
+            oracle_io === nothing || rclone_upload(p.suffix, oracle_csv)
         end
 
         step % 25 == 0 &&
@@ -317,11 +364,18 @@ function run_simulation(p::SimParameters; resume = nothing)
     end
 
     # CSVs already streamed per-step / per-snapshot above. Just close.
-    dump_io !== nothing && close(dump_io)
     close(cons_io)
     close(snap_io)
     # Final mirror so the last steps (if not a multiple of 25) reach S3 too.
     rclone_upload(p.suffix, cons_csv)
+    if oracle_io !== nothing
+        close(oracle_io)
+        rclone_upload(p.suffix, oracle_csv)
+    end
+    if dump_io !== nothing   # GBs: uploaded once, at the end
+        close(dump_io)
+        rclone_upload(p.suffix, dump_file)
+    end
     println("Saved $cons_csv")
     println("Saved $snap_csv")
 
@@ -391,6 +445,8 @@ function main(args = ARGS)
                 println("GPU LB log-gradient enabled")
             end
         else
+            # The NN warm start runs its MLP on the device too.
+            NN_TO_DEVICE[] = getglobal(Main, :CuArray)
             if p.gpu_fp32
                 println("  ⚠ FP32 collision kernel (conservation experiment)")
                 COLLISION_FN[] = getglobal(Main, :compute_collision_gpu32!)

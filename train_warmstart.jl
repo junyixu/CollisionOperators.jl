@@ -1,162 +1,150 @@
-# Offline trainer for the NN warm start (see warmstart_nn.jl for the model
-# and PLAN_nn_warmstart.md for the pipeline). Hand-rolled Adam + backprop —
-# zero non-stdlib deps.
+#! /usr/bin/env -S julia --startup-file=no
+# Offline trainer for the NN warm start (model and dump format: warmstart.jl).
 #
-# Data: training_dump_<suffix>.bin from a run with dump_training=true.
-# Labels δ = (v^{n+1,*} − vⁿ − Δt·v̇ⁿ)/Δt² from consecutive records.
-# Split: by time blocks (last val_frac of step pairs = validation) — random
-# splits would leak across adjacent, highly correlated steps.
+#   julia --startup-file=no train_warmstart.jl --train=a.bin[,b.bin…] --out=nn.jls \
+#         [--val=c.bin,…] [--val_frac=0.2] [--epochs=30] [--hidden=128] [--depth=3] \
+#         [--lr=1e-3] [--batch=4096] [--per_step=1000] [--seed=0]
+#   julia --startup-file=no train_warmstart.jl --eval=nn.jls --val=c.bin[,…]
 #
-# Run as (systemd unit for real training, foreground ok for short tests):
-#   julia --project=. train_warmstart.jl training_dump_<suffix>.bin \
-#         nn_warmstart_<suffix>.jls [--epochs=30] [--hidden=128] [--lr=1e-3] \
-#         [--batch=4096] [--max_samples=2000000] [--val_frac=0.2] [--seed=0]
-include("warmstart_nn.jl")
+# Samples `per_step` random particles from every record. Validation is either the
+# `--val` dumps (a later time window, another seed) or, without them, the last
+# `val_frac` of each training dump's steps: a random split would leak between
+# adjacent steps, which are nearly identical.
+#
+# The score is decades = log10(‖δ‖ / ‖δ − δ̂‖) over the validation samples: how many
+# orders of magnitude the predictor takes off the Euler gap. Compare it with the
+# oracle sweep (oracle_<suffix>.csv) to read off the iterations it would save.
+# A ridge regression on the same features is printed as a baseline.
 
-length(ARGS) >= 2 || error("usage: train_warmstart.jl <dump.bin> <out.jls> [--key=val …]")
-dump_file, out_file = ARGS[1], ARGS[2]
-opts = Dict{String,String}()
-for tok in ARGS[3:end]
-    m = match(r"^--(\w+)=(.+)$", tok)
-    m === nothing && error("bad option $tok")
-    opts[m.captures[1]] = m.captures[2]
+using LinearAlgebra
+using Printf
+using Random
+include(joinpath(@__DIR__, "warmstart.jl"))
+
+function parse_cli(args)
+    opts = Dict{String, String}()
+    for tok in args
+        m = match(r"^--(\w+)=(.*)$", tok)
+        m === nothing && error("bad option $tok (want --key=value)")
+        opts[m.captures[1]] = m.captures[2]
+    end
+    return opts
 end
-epochs      = parse(Int,     get(opts, "epochs",      "30"))
-hidden      = parse(Int,     get(opts, "hidden",      "128"))
-lr          = parse(Float32, get(opts, "lr",          "1e-3"))
-batch       = parse(Int,     get(opts, "batch",       "4096"))
-max_samples = parse(Int,     get(opts, "max_samples", "2000000"))
-val_frac    = parse(Float64, get(opts, "val_frac",    "0.2"))
-seed        = parse(Int,     get(opts, "seed",        "0"))
 
-N_dump, n_dofs, dt = open(read_dump_header, dump_file)
-n_records = count_dump_records(dump_file, N_dump, n_dofs)
-n_pairs   = n_records - 1
-n_pairs >= 10 || error("dump too short: $n_records records")
-per_pair  = clamp(ceil(Int, max_samples / n_pairs), 1, N_dump)
+files(s) = String.(split(s, ','; keepempty = false))
 
-# Breakpoints from the step-0 fs snapshot next to the dump (same logic as probe).
-function load_breakpoints(dump_file)
-    m = match(r"training_dump_(.+)\.bin", basename(dump_file))
-    if m !== nothing
-        snap = "fs_snapshot_$(m.captures[1])_step0000.csv"
-        if isfile(snap)
-            bp1 = Float64[]; bp2 = Float64[]
-            for ln in eachline(snap)
-                startswith(ln, "# bp1=") && (bp1 = parse.(Float64, split(ln[8:end], ',')))
-                startswith(ln, "# bp2=") && (bp2 = parse.(Float64, split(ln[8:end], ',')))
-                isempty(bp1) || isempty(bp2) || return bp1, bp2
+# Features and labels of `per_step` particles from every record of each dump,
+# with the record's position in its dump as a fraction in [0, 1).
+function collect_samples(dumps; per_step::Int, rng::AbstractRNG)
+    Xs, Ys, pos = Matrix{Float32}[], Matrix{Float32}[], Float64[]
+    for f in dumps
+        h = open(read_dump_header, f)
+        nrec = (filesize(f) - dump_header_bytes(h)) ÷ dump_record_bytes(h.N)
+        nrec > 0 || error("$f has no records")
+        k = min(per_step, h.N)
+        r = 0
+        foreach_dump_record(f) do h, rec
+            idx = randperm(rng, h.N)[1:k]
+            X = Matrix{Float32}(undef, N_FEAT, k)
+            build_features!(X, rec.v, rec.dot_v, rec.G, h.w, h.bp1, h.bp2, rec.dt, idx)
+            push!(Xs, X)
+            push!(Ys, permutedims(rec.δ[idx, :]))
+            append!(pos, fill(r / nrec, k))
+            r += 1
+        end
+        @printf("%s: N=%d, %d records, %d samples\n", f, h.N, nrec, k * nrec)
+    end
+    return reduce(hcat, Xs), reduce(hcat, Ys), pos
+end
+
+decades(Y, Ŷ) = log10(sqrt(sum(abs2, Y)) / sqrt(sum(abs2, Y .- Ŷ)))
+
+function ridge_decades(Xtr, Ytr, Xva, Yva; λ = 1e-6)
+    A(X) = [Float64.(X); ones(1, size(X, 2))]
+    At = A(Xtr)
+    B = (At * At' + λ * size(At, 2) * I) \ (At * Float64.(Ytr)')
+    return decades(Float64.(Yva), (A(Xva)' * B)')
+end
+
+function train(opts)
+    rng = Xoshiro(parse(Int, get(opts, "seed", "0")))
+    epochs = parse(Int, get(opts, "epochs", "30"))
+    hidden = parse(Int, get(opts, "hidden", "128"))
+    depth = parse(Int, get(opts, "depth", "3"))
+    lr0 = parse(Float32, get(opts, "lr", "1e-3"))
+    batch = parse(Int, get(opts, "batch", "4096"))
+    per_step = parse(Int, get(opts, "per_step", "1000"))
+    out = opts["out"]
+
+    X, Y, pos = collect_samples(files(opts["train"]); per_step, rng)
+    if haskey(opts, "val")
+        Xva, Yva, _ = collect_samples(files(opts["val"]); per_step, rng)
+        Xtr, Ytr = X, Y
+    else
+        cut = 1 - parse(Float64, get(opts, "val_frac", "0.2"))
+        tr, va = pos .< cut, pos .>= cut
+        Xtr, Ytr, Xva, Yva = X[:, tr], Y[:, tr], X[:, va], Y[:, va]
+    end
+    @printf("train %d samples, val %d samples\n", size(Xtr, 2), size(Xva, 2))
+    @printf("ridge baseline: val decades %.3f\n", ridge_decades(Xtr, Ytr, Xva, Yva))
+
+    μx = vec(sum(Xtr; dims = 2)) ./ size(Xtr, 2)
+    σx = sqrt.(vec(sum(abs2, Xtr .- μx; dims = 2)) ./ size(Xtr, 2)) .+ 1.0f-8
+    σy = sqrt.(vec(sum(abs2, Ytr; dims = 2)) ./ size(Ytr, 2)) .+ 1.0f-30
+    Xn, Yn, Xvn = (Xtr .- μx) ./ σx, Ytr ./ σy, (Xva .- μx) ./ σx
+
+    layers = init_mlp(rng; hidden, depth)
+    mom = [(zero(W), zero(b)) for (W, b) in layers]
+    vel = [(zero(W), zero(b)) for (W, b) in layers]
+    β1, β2, ϵ = 0.9f0, 0.999f0, 1.0f-8
+    t = 0
+    nb = cld(size(Xn, 2), batch)
+    best = -Inf
+    for ep in 1:epochs
+        perm = randperm(rng, size(Xn, 2))
+        loss_sum = 0.0
+        for k in 1:nb
+            cols = perm[((k - 1) * batch + 1):min(k * batch, end)]
+            loss, g = mlp_loss_grad(layers, Xn[:, cols], Yn[:, cols])
+            loss_sum += loss
+            t += 1
+            lr = lr0 * Float32(0.5 * (1 + cospi(t / (epochs * nb))))   # cosine decay
+            for l in eachindex(layers), j in 1:2
+                θ, m, v, gj = layers[l][j], mom[l][j], vel[l][j], g[l][j]
+                @. m = β1 * m + (1 - β1) * gj
+                @. v = β2 * v + (1 - β2) * gj^2
+                @. θ -= lr * (m / (1 - β1^t)) / (sqrt(v / (1 - β2^t)) + ϵ)
             end
         end
-    end
-    @warn "breakpoints not found next to dump; using sq_d04 preset mesh"
-    bp = [-6.0; -5.0; collect(LinRange(-4.0, 4.0, 21)); 5.0; 6.0]
-    return bp, copy(bp)
-end
-const BP1, BP2 = load_breakpoints(dump_file)
-
-println("dump: N=$N_dump n_dofs=$n_dofs dt=$dt records=$n_records " *
-        "→ $per_pair samples/pair, ≤$(per_pair * n_pairs) total")
-
-# ---- collect samples (streaming) ----------------------------------------------
-rng = Random.Xoshiro(seed)
-S_cap = per_pair * n_pairs
-X = Matrix{Float32}(undef, N_FEAT, S_cap)
-Y = Matrix{Float32}(undef, 2, S_cap)
-pair_of = Vector{Int}(undef, S_cap)   # pair index per sample (for time split)
-
-s_used = 0
-pair_i = 0
-prev = nothing
-foreach_dump_record(dump_file) do step, v, dot_v, G, L
-    global prev, s_used, pair_i
-    if prev !== nothing && step == prev.step + 1
-        pair_i += 1
-        N = size(v, 1)
-        w = fill(1.0 / N, N)
-        vp  = Float64.(prev.v);  dvp = Float64.(prev.dot_v)
-        Xfull = build_features(vp, dvp, Float64.(prev.G), w, BP1, BP2, dt)
-        idx = rand(rng, 1:N, per_pair)
-        @inbounds for α in idx
-            s_used += 1
-            for i in 1:N_FEAT
-                X[i, s_used] = Xfull[i, α]
-            end
-            Y[1, s_used] = (Float64(v[α, 1]) - vp[α, 1] - dt * dvp[α, 1]) / dt^2
-            Y[2, s_used] = (Float64(v[α, 2]) - vp[α, 2] - dt * dvp[α, 2]) / dt^2
-            pair_of[s_used] = pair_i
+        dva = decades(Yva, mlp_forward(layers, Xvn) .* σy)
+        saved = dva > best
+        if saved
+            best = dva
+            info = Dict{String, Any}("val_decades" => dva, "epoch" => ep,
+                "train" => opts["train"], "val" => get(opts, "val", "time split"),
+                "hidden" => hidden, "depth" => depth, "per_step" => per_step)
+            save_warmstart_model(out,
+                WarmstartModel(deepcopy(layers), μx, σx, σy, FEATURE_VERSION, info))
         end
+        @printf("epoch %3d  train loss %.4g  val decades %.3f%s\n",
+            ep, loss_sum / nb, dva, saved ? "  [saved]" : "")
     end
-    prev = (; step, v, dot_v, G)
+    @printf("\nbest val decades %.3f → %s\ndeploy: --warmstart=nn --nn_weights=%s\n",
+        best, out, out)
 end
-X = X[:, 1:s_used]; Y = Y[:, 1:s_used]; pair_of = pair_of[1:s_used]
-println("collected $s_used samples from $pair_i pairs")
 
-# ---- normalize ------------------------------------------------------------------
-μx = vec(sum(X; dims=2)) ./ s_used
-σx = sqrt.(vec(sum(abs2, X .- μx; dims=2)) ./ s_used) .+ 1.0f-8
-σy = sqrt.(vec(sum(abs2, Y; dims=2)) ./ s_used) .+ 1.0f-30
-Xn = (X .- μx) ./ σx
-Yn = Y ./ σy
-
-# ---- time-block split ------------------------------------------------------------
-val_start_pair = ceil(Int, (1 - val_frac) * pair_i)
-train_idx = findall(<(val_start_pair), pair_of)
-val_idx   = findall(>=(val_start_pair), pair_of)
-println("train=$(length(train_idx))  val=$(length(val_idx))  " *
-        "(val = pairs ≥ $val_start_pair of $pair_i)")
-
-# ---- Adam ------------------------------------------------------------------------
-θ = init_mlp(; hidden, seed)
-adam_m = map(zero, θ); adam_v = map(zero, θ)
-β1, β2, ϵ = 0.9f0, 0.999f0, 1.0f-8
-t_adam = 0
-
-function adam_step!(θ, g)
-    global t_adam += 1
-    bc1 = 1 - β1^t_adam; bc2 = 1 - β2^t_adam
-    for k in keys(θ)
-        @. adam_m[k] = β1 * adam_m[k] + (1 - β1) * g[k]
-        @. adam_v[k] = β2 * adam_v[k] + (1 - β2) * g[k]^2
-        @. θ[k] -= lr * (adam_m[k] / bc1) / (sqrt(adam_v[k] / bc2) + ϵ)
+function evaluate(opts)
+    m = load_warmstart_model(opts["eval"])
+    println("model: ", m.info)
+    for f in files(opts["val"])
+        X, Y, pos = collect_samples([f]; per_step = parse(Int, get(opts, "per_step", "1000")),
+            rng = Xoshiro(0))
+        Ŷ = predict_delta(m, m.layers, (X .- m.μx) ./ m.σx)
+        thirds = [findall(p -> (k - 1) / 3 <= p < k / 3, pos) for k in 1:3]
+        @printf("%s: decades %.3f  (by thirds of the run: %s)\n", f, decades(Y, Ŷ),
+            join((@sprintf("%.3f", decades(Y[:, i], Ŷ[:, i])) for i in thirds), ", "))
     end
 end
 
-val_loss(θ) = begin
-    Ŷ = mlp_forward(θ, Xn[:, val_idx])
-    sum(abs2, Ŷ .- Yn[:, val_idx]) / (2 * length(val_idx))
-end
-# decades on the *unnormalized* residual, the deployment-relevant number
-val_decades(θ) = begin
-    Ŷ = mlp_forward(θ, Xn[:, val_idx]) .* σy
-    rms_y = sqrt(sum(abs2, Y[:, val_idx]) / length(val_idx))
-    rms_r = sqrt(sum(abs2, Ŷ .- Y[:, val_idx]) / length(val_idx))
-    log10(rms_y / rms_r)
-end
-
-best_val = Inf
-for ep in 1:epochs
-    perm = Random.shuffle(rng, train_idx)
-    tr_loss = 0.0; nb = 0
-    for lo in 1:batch:length(perm)
-        cols = perm[lo:min(lo + batch - 1, length(perm))]
-        loss, g = mlp_loss_grad(θ, Xn[:, cols], Yn[:, cols])
-        adam_step!(θ, g)
-        tr_loss += loss; nb += 1
-    end
-    vl = val_loss(θ)
-    vd = val_decades(θ)
-    marker = ""
-    if vl < best_val
-        global best_val = vl
-        save_warmstart_model(out_file,
-            WarmstartModel(map(copy, θ), Float32.(μx), Float32.(σx),
-                           Float32.(σy), FEATURE_VERSION))
-        marker = "  [saved]"
-    end
-    println("epoch $ep/$epochs  train=$(round(tr_loss/nb; sigdigits=4))  " *
-            "val=$(round(vl; sigdigits=4))  val_decades=$(round(vd; digits=2))$marker")
-end
-
-println("\nbest model → $out_file")
-println("deploy: --warmstart=nn --nn_weights=$out_file")
+opts = parse_cli(ARGS)
+haskey(opts, "eval") ? evaluate(opts) : train(opts)
