@@ -186,8 +186,9 @@ function NNWarmstart(model::WarmstartModel, N::Int; cap::Float64 = 3.0,
     return NNWarmstart(model, layers_dev, to_device, Matrix{Float32}(undef, N_FEAT, N), cap)
 end
 
+# Scale on the host: σy is a host vector, which a GPU broadcast cannot read.
 _nn_predict(nn::NNWarmstart, Xn) =
-    Array(predict_delta(nn.model, nn.layers_dev, nn.to_device(Xn)))
+    Array(mlp_forward(nn.layers_dev, nn.to_device(Xn))) .* nn.model.σy
 
 """
     nn_correct!(v1, nn, v, dot_v, G, w, bp1, bp2, dt) -> n_clipped
