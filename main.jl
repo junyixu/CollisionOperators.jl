@@ -29,6 +29,7 @@ using LinearAlgebra: ldiv!
 include("io.jl")       # rclone mirror, params record, checkpoints, cons CSV
 include("solver.jl")   # Picard map + Anderson solve, CPU/GPU hot-loop hooks
 include("plots.jl")    # fs_snapshot CSV + diagnostics PNGs
+include("warmstart_nn.jl")  # NN warmstart model training data I/O + inference
 
 function run_simulation(p::SimParameters; resume = nothing)
     print_summary(p)
