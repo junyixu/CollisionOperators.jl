@@ -445,8 +445,9 @@ function main(args = ARGS)
                 println("GPU LB log-gradient enabled")
             end
         else
-            # The NN warm start runs its MLP on the device too.
-            NN_TO_DEVICE[] = getglobal(Main, :CuArray)
+            # The NN warm start runs its MLP on the device too. `using CUDA` just
+            # happened in a newer world, so plain getglobal cannot see CuArray yet.
+            NN_TO_DEVICE[] = Base.invokelatest(getglobal, Main, :CuArray)
             if p.gpu_fp32
                 println("  ⚠ FP32 collision kernel (conservation experiment)")
                 COLLISION_FN[] = getglobal(Main, :compute_collision_gpu32!)
