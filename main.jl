@@ -479,6 +479,7 @@ function main(args = ARGS)
         println("$(res.label):  avg=$(round(a; digits=2))  max=$(maximum(res.iter_history))" *
                 "  steps=$(length(res.iter_history))")
     end
+    get(ENV, "RCLONE_WAIT", "1") != "0" && wait_uploads()
 end
 
 # Run only when executed as a script (`julia main.jl ...`), so the test suite and

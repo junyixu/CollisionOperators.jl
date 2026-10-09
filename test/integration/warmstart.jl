@@ -62,6 +62,11 @@ end
     seen = Int[]
     foreach_dump_record((h, rec) -> push!(seen, rec.step), fname)
     @test seen == [1, 2, 3, 4]
+    # a run killed mid-record leaves a partial tail; readers stop before it
+    open(io -> write(io, zeros(UInt8, 100)), fname, "a")
+    seen = Int[]
+    foreach_dump_record((h, rec) -> push!(seen, rec.step), fname)
+    @test seen == [1, 2, 3, 4]
     @test_throws ErrorException open_training_dump(fname, bp, bp[1:(end - 1)], w;
         resume_step = 1)
     rm(fname)

@@ -25,23 +25,26 @@ function rclone_remote(suffix::String)
 end
 
 # Uploads run in the background so the time stepping never waits on the network
-# (a 1.9 GB dump took 13+ min from a US pod to MPCDF). They also outlive the
-# Julia process, so the next run can start while the last one's files are still
-# going up: a launch script that must not finish early waits for `pgrep rclone`.
-const UPLOADS = Dict{String, Base.Process}()   # latest upload per local file
+# (a 1.9 GB dump took 13+ min from a US pod to MPCDF). `main` waits for them
+# before it returns (`wait_uploads`), so a pod deleted after the run loses nothing.
+#   RCLONE_WAIT=0    → return without waiting, so a launch script can start the
+#                      next run while these still upload; it must then wait for
+#                      `pgrep -x rclone` to be empty before it finishes
+const UPLOADS = Dict{Tuple{String, String}, Base.Process}()   # (remote, file) → latest upload
 
 """
     rclone_upload(suffix, fname; final = false)
 
 Start uploading `fname` to the run's S3 directory without waiting. While an
-earlier upload of the same file is still running, a mid-run call is skipped (the
-next one catches up) and a `final` call waits for it and then uploads again, so
-the last version always reaches S3.
+earlier upload of the same file to the same place is still running, a mid-run
+call is skipped (the next one catches up) and a `final` call waits for it and then
+uploads again, so the last version always reaches S3.
 """
 function rclone_upload(suffix::String, fname::String; final::Bool = false)
     rclone_enabled() || return nothing
     remote = rclone_remote(suffix)
-    prev = get(UPLOADS, fname, nothing)
+    key = (remote, abspath(fname))
+    prev = get(UPLOADS, key, nothing)
     if prev !== nothing && process_running(prev)
         final || return nothing
         wait(prev)
@@ -50,11 +53,25 @@ function rclone_upload(suffix::String, fname::String; final::Bool = false)
         @warn "rclone upload failed" fname remote exitcode = prev.exitcode
     try
         # The conservation CSV grows while it uploads; send what is there.
-        UPLOADS[fname] = run(`rclone copyto --local-no-check-updated $fname $remote/$fname`;
+        UPLOADS[key] = run(`rclone copyto --local-no-check-updated $fname $remote/$fname`;
             wait = false)
     catch e
         @warn "rclone upload failed" fname remote exception = e
     end
+    return nothing
+end
+
+"""
+    wait_uploads()
+
+Block until every background upload has finished, warning about any that failed.
+"""
+function wait_uploads()
+    for ((remote, fname), proc) in UPLOADS
+        wait(proc)
+        success(proc) || @warn "rclone upload failed" fname remote exitcode = proc.exitcode
+    end
+    empty!(UPLOADS)
     return nothing
 end
 

@@ -47,6 +47,9 @@ const NSTEPS = parse(Int, get(probe_opts, "steps", "5"))
 const NPROBES = parse(Int, get(probe_opts, "probes", "8"))
 const FD_H = parse(Float64, get(probe_opts, "fd_h", P.gpu_fp32 ? "1e-4" : "1e-5"))
 P.collision_model == :landau || error("probe is Landau-only")
+# solve_pc!/solve_dc! copy step_anderson! for its default exit (return 𝒢(v)) and
+# without restarts; other settings would make pc_id stop matching it.
+P.exit_picard_step || error("probe assumes exit_picard_step = true")
 USE_LOGSQ[] = P.use_logsq
 P.use_gpu && enable_gpu!(P)
 

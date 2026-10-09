@@ -3,13 +3,15 @@
 #
 #   julia --startup-file=no train_warmstart.jl --train=a.bin[,b.bin…] --out=nn.jls \
 #         [--val=c.bin,…] [--val_frac=0.2] [--epochs=30] [--hidden=128] [--depth=3] \
-#         [--lr=1e-3] [--batch=4096] [--per_step=1000] [--seed=0]
-#   julia --startup-file=no train_warmstart.jl --eval=nn.jls --val=c.bin[,…]
+#         [--lr=1e-3] [--batch=4096] [--per_step=1000] [--seed=0] [--stag_window=30]
+#   julia --startup-file=no train_warmstart.jl --eval=nn.jls --val=c.bin[,…] [--stag_window=30]
 #
 # Samples `per_step` random particles from every record. Validation is either the
 # `--val` dumps (a later time window, another seed) or, without them, the last
 # `val_frac` of each training dump's steps: a random split would leak between
-# adjacent steps, which are nearly identical.
+# adjacent steps, which are nearly identical. Steps whose solve left through the
+# stagnation exit (iter a multiple of the run's `stag_window`; 0 keeps all) are
+# skipped: their v* is the best iterate, not the root, so their label is off.
 #
 # The score is decades = log10(‖δ‖ / ‖δ − δ̂‖) over the validation samples: how many
 # orders of magnitude the predictor takes off the Euler gap. Compare it with the
@@ -33,26 +35,31 @@ end
 
 files(s) = String.(split(s, ','; keepempty = false))
 
-# Features and labels of `per_step` particles from every record of each dump,
-# with the record's position in its dump as a fraction in [0, 1).
-function collect_samples(dumps; per_step::Int, rng::AbstractRNG)
+# Features and labels of `per_step` particles from every converged record of each
+# dump, with the record's position in its dump as a fraction in [0, 1).
+function collect_samples(dumps; per_step::Int, rng::AbstractRNG, stag::Int)
     Xs, Ys, pos = Matrix{Float32}[], Matrix{Float32}[], Float64[]
     for f in dumps
         h = open(read_dump_header, f)
         nrec = (filesize(f) - dump_header_bytes(h)) ÷ dump_record_bytes(h.N)
         nrec > 0 || error("$f has no records")
         k = min(per_step, h.N)
-        r = 0
+        r = 0; skipped = 0
         foreach_dump_record(f) do h, rec
+            r += 1
+            if stag > 0 && rec.iter % stag == 0
+                skipped += 1
+                return
+            end
             idx = randperm(rng, h.N)[1:k]
             X = Matrix{Float32}(undef, N_FEAT, k)
             build_features!(X, rec.v, rec.dot_v, rec.G, h.w, h.bp1, h.bp2, rec.dt, idx)
             push!(Xs, X)
             push!(Ys, permutedims(rec.δ[idx, :]))
-            append!(pos, fill(r / nrec, k))
-            r += 1
+            append!(pos, fill((r - 1) / nrec, k))
         end
-        @printf("%s: N=%d, %d records, %d samples\n", f, h.N, nrec, k * nrec)
+        @printf("%s: N=%d, %d records (%d stalled, skipped), %d samples\n",
+            f, h.N, nrec, skipped, k * (nrec - skipped))
     end
     return reduce(hcat, Xs), reduce(hcat, Ys), pos
 end
@@ -74,11 +81,12 @@ function train(opts)
     lr0 = parse(Float32, get(opts, "lr", "1e-3"))
     batch = parse(Int, get(opts, "batch", "4096"))
     per_step = parse(Int, get(opts, "per_step", "1000"))
+    stag = parse(Int, get(opts, "stag_window", "30"))
     out = opts["out"]
 
-    X, Y, pos = collect_samples(files(opts["train"]); per_step, rng)
+    X, Y, pos = collect_samples(files(opts["train"]); per_step, rng, stag)
     if haskey(opts, "val")
-        Xva, Yva, _ = collect_samples(files(opts["val"]); per_step, rng)
+        Xva, Yva, _ = collect_samples(files(opts["val"]); per_step, rng, stag)
         Xtr, Ytr = X, Y
     else
         cut = 1 - parse(Float64, get(opts, "val_frac", "0.2"))
@@ -138,7 +146,7 @@ function evaluate(opts)
     println("model: ", m.info)
     for f in files(opts["val"])
         X, Y, pos = collect_samples([f]; per_step = parse(Int, get(opts, "per_step", "1000")),
-            rng = Xoshiro(0))
+            rng = Xoshiro(0), stag = parse(Int, get(opts, "stag_window", "30")))
         Ŷ = predict_delta(m, m.layers, (X .- m.μx) ./ m.σx)
         thirds = [findall(p -> (k - 1) / 3 <= p < k / 3, pos) for k in 1:3]
         @printf("%s: decades %.3f  (by thirds of the run: %s)\n", f, decades(Y, Ŷ),

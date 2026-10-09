@@ -305,7 +305,7 @@ end
 """
     foreach_dump_record(f, fname) -> DumpHeader
 
-Stream the records of a dump, calling `f(header, rec)` with
+Stream the complete records of a dump, calling `f(header, rec)` with
 `rec = (; step, dt, iter, r0, v, dot_v, G, δ)` (N×2 Float32 matrices, reused
 between calls).
 """
@@ -313,7 +313,9 @@ function foreach_dump_record(f, fname::String)
     open(fname) do io
         h = read_dump_header(io)
         bufs = [Matrix{Float32}(undef, h.N, 2) for _ in 1:4]
-        while !eof(io)
+        # complete records only: a run killed mid-write can leave a partial tail
+        nrec = (filesize(fname) - dump_header_bytes(h)) ÷ dump_record_bytes(h.N)
+        for _ in 1:nrec
             step = Int(read(io, Int64))
             dt = read(io, Float64)
             iter = Int(read(io, Int64))
