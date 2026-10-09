@@ -23,6 +23,7 @@ makedocs(;
         "Cost of the implicit solve" => "implicit_solve_cost.md",
         "Anderson window update" => "anderson_window.md",
         "Newton–Krylov vs. Anderson" => "newton_krylov.md",
+        "Defect correction vs. Anderson" => "defect_correction.md",
         "Driver API" => "solver.md"
     ]
 )
