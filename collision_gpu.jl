@@ -281,8 +281,10 @@ end
 
 # ---- F and the metric A in one pass (solver = :defect) ------------------------
 # `_landau_partial!` plus A_γ = Σ_α w_α U(v_γ − v_α) (3 entries). F is accumulated
-# exactly as there, so it is bit-identical to compute_collision_gpu!; the extra
-# cost is three FMA chains per pair and three more partial arrays.
+# with the same expressions, but the compiler may fuse multiply-adds differently in
+# the longer loop, so F agrees with compute_collision_gpu! to about one ulp, not bit
+# for bit (max |ΔF| 2–4e-16 on an H100 and an RTX 4090). Measured cost at N = 40k:
+# 1.25x (H100) and 1.34x (RTX 4090) that of the plain kernel.
 
 function _landau_metric_partial!(p1, p2, q11, q12, q22, v1, v2, g1, g2, w, N, S,
         lo1, hi1, lo2, hi2)

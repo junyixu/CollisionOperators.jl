@@ -274,7 +274,7 @@ function run_simulation(p::SimParameters; resume = nothing)
             Base.invokelatest(COMPG_FN[], ws, G, v_particles, L_vec)
             if fz === nothing
                 Base.invokelatest(COLLISION_FN[], ws, dot_v, v_particles, w_particles, G)
-            else   # same F, bit for bit, plus the metric A
+            else   # the same F (to an ulp on the GPU) plus the metric A
                 Base.invokelatest(COLLMETRIC_FN[], ws, dot_v, fz.A, v_particles,
                     w_particles, G)
             end
