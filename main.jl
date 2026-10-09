@@ -391,6 +391,50 @@ function run_simulation(p::SimParameters; resume = nothing)
                  p.use_anderson ? "Anderson(m=$(p.m_anderson))" : "Picard"))
 end
 
+"""
+    enable_gpu!(p)
+
+Load the CUDA kernels and repoint the hot-loop hooks ([`COLLISION_FN`](@ref) and
+friends) at them. Called at run time, so every call through the hooks must go via
+`invokelatest`. Shared by `main` and scripts/predictor_probe.jl.
+"""
+function enable_gpu!(p::SimParameters)
+    println("GPU enabled — loading CUDA…")
+    # collision_gpu.jl provides _upload_col! (shared staging helper) plus the
+    # O(N²) Landau kernels; projection_gpu.jl provides the P_DEG=2 particle↔
+    # spline kernels used by BOTH operators.
+    include(joinpath(@__DIR__, "collision_gpu.jl"))
+    if p.P_DEG == 2
+        include(joinpath(@__DIR__, "projection_gpu.jl"))
+        L2PROJ_FN[] = getglobal(Main, :l2_project_gpu!)
+        COMPG_FN[] = getglobal(Main, :compute_G_gpu!)
+        println("GPU projection chain enabled (P_DEG=2 kernels)")
+    else
+        @warn "use_gpu: projection kernels are P_DEG=2-specialized; " *
+              "projection stays on CPU for P_DEG=$(p.P_DEG)"
+    end
+
+    if p.collision_model == :lb
+        # LB has no O(N²) sum: GPU accelerates the projection + log-gradient
+        # gather (the ~40 ms/iter bulk); the O(N) drift stays on CPU.
+        if p.P_DEG == 2
+            LOGGRAD_FN[] = getglobal(Main, :eval_loggrad_gpu!)
+            println("GPU LB log-gradient enabled")
+        end
+    else
+        # The NN warm start runs its MLP on the device too. `using CUDA` just
+        # happened in a newer world, so plain getglobal cannot see CuArray yet.
+        NN_TO_DEVICE[] = Base.invokelatest(getglobal, Main, :CuArray)
+        if p.gpu_fp32
+            println("  ⚠ FP32 collision kernel (conservation experiment)")
+            COLLISION_FN[] = getglobal(Main, :compute_collision_gpu32!)
+        else
+            COLLISION_FN[] = getglobal(Main, :compute_collision_gpu!)
+        end
+    end
+    return nothing
+end
+
 function main(args = ARGS)
     if isempty(args)
         preset = "parameters_default.jl"
@@ -421,41 +465,7 @@ function main(args = ARGS)
     params_loaded = include(joinpath(@__DIR__, preset))
     p = parse_overrides(params_loaded::SimParameters, overrides)
 
-    if p.use_gpu
-        println("GPU enabled — loading CUDA…")
-        # collision_gpu.jl provides _upload_col! (shared staging helper) plus the
-        # O(N²) Landau kernels; projection_gpu.jl provides the P_DEG=2 particle↔
-        # spline kernels used by BOTH operators.
-        include(joinpath(@__DIR__, "collision_gpu.jl"))
-        if p.P_DEG == 2
-            include(joinpath(@__DIR__, "projection_gpu.jl"))
-            L2PROJ_FN[] = getglobal(Main, :l2_project_gpu!)
-            COMPG_FN[] = getglobal(Main, :compute_G_gpu!)
-            println("GPU projection chain enabled (P_DEG=2 kernels)")
-        else
-            @warn "use_gpu: projection kernels are P_DEG=2-specialized; " *
-                  "projection stays on CPU for P_DEG=$(p.P_DEG)"
-        end
-
-        if p.collision_model == :lb
-            # LB has no O(N²) sum: GPU accelerates the projection + log-gradient
-            # gather (the ~40 ms/iter bulk); the O(N) drift stays on CPU.
-            if p.P_DEG == 2
-                LOGGRAD_FN[] = getglobal(Main, :eval_loggrad_gpu!)
-                println("GPU LB log-gradient enabled")
-            end
-        else
-            # The NN warm start runs its MLP on the device too. `using CUDA` just
-            # happened in a newer world, so plain getglobal cannot see CuArray yet.
-            NN_TO_DEVICE[] = Base.invokelatest(getglobal, Main, :CuArray)
-            if p.gpu_fp32
-                println("  ⚠ FP32 collision kernel (conservation experiment)")
-                COLLISION_FN[] = getglobal(Main, :compute_collision_gpu32!)
-            else
-                COLLISION_FN[] = getglobal(Main, :compute_collision_gpu!)
-            end
-        end
-    end
+    p.use_gpu && enable_gpu!(p)
 
     params_file = "params_$(p.suffix).jl"
     save_params(params_file, p)
