@@ -24,13 +24,36 @@ function rclone_remote(suffix::String)
         "mpcdf-s3://collision-operators/" * replace(suffix, '_' => '-'))
 end
 
-function rclone_upload(suffix::String, fname::String)
+# Uploads run in the background so the time stepping never waits on the network
+# (a 1.9 GB dump took 13+ min from a US pod to MPCDF). They also outlive the
+# Julia process, so the next run can start while the last one's files are still
+# going up: a launch script that must not finish early waits for `pgrep rclone`.
+const UPLOADS = Dict{String, Base.Process}()   # latest upload per local file
+
+"""
+    rclone_upload(suffix, fname; final = false)
+
+Start uploading `fname` to the run's S3 directory without waiting. While an
+earlier upload of the same file is still running, a mid-run call is skipped (the
+next one catches up) and a `final` call waits for it and then uploads again, so
+the last version always reaches S3.
+"""
+function rclone_upload(suffix::String, fname::String; final::Bool = false)
     rclone_enabled() || return nothing
     remote = rclone_remote(suffix)
+    prev = get(UPLOADS, fname, nothing)
+    if prev !== nothing && process_running(prev)
+        final || return nothing
+        wait(prev)
+    end
+    prev === nothing || success(prev) ||
+        @warn "rclone upload failed" fname remote exitcode = prev.exitcode
     try
-        run(`rclone copyto $fname $remote/$fname`)
+        # The conservation CSV grows while it uploads; send what is there.
+        UPLOADS[fname] = run(`rclone copyto --local-no-check-updated $fname $remote/$fname`;
+            wait = false)
     catch e
-        @warn "rclone upload failed" fname remote exception=e
+        @warn "rclone upload failed" fname remote exception = e
     end
     return nothing
 end

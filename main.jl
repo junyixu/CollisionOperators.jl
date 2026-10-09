@@ -367,14 +367,14 @@ function run_simulation(p::SimParameters; resume = nothing)
     close(cons_io)
     close(snap_io)
     # Final mirror so the last steps (if not a multiple of 25) reach S3 too.
-    rclone_upload(p.suffix, cons_csv)
+    rclone_upload(p.suffix, cons_csv; final = true)
     if oracle_io !== nothing
         close(oracle_io)
-        rclone_upload(p.suffix, oracle_csv)
+        rclone_upload(p.suffix, oracle_csv; final = true)
     end
-    if dump_io !== nothing   # GBs: uploaded once, at the end
+    if dump_io !== nothing   # GBs: uploaded once, at the end, in the background
         close(dump_io)
-        rclone_upload(p.suffix, dump_file)
+        rclone_upload(p.suffix, dump_file; final = true)
     end
     println("Saved $cons_csv")
     println("Saved $snap_csv")
