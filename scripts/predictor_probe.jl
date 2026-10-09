@@ -22,9 +22,15 @@
 #   pc_diag  Anderson on v ↦ v + P(𝒢(v) − v), P_γ = (I − J_γγ)⁻¹, with the 2×2
 #            diagonal blocks J_γγ of the Picard map estimated by random-sign probing
 #            (2·probes map evaluations): what a local preconditioner could do at best
+#   dc_self  defect correction: each outer iteration evaluates the full map 𝒢 once at
+#            v_k, freezes the pair sums A_k, B_k at its midpoint, and solves the cheap
+#            map Φ_k(u) = vⁿ + Δt·(B_k − A_k G_eff(u)) + c_k (G_eff with projection and
+#            Gonzalez term, no pair sum; c_k makes Φ_k(v_k) = 𝒢(v_k)) by Anderson;
+#            `iter` counts full maps, `inner_evals` cheap maps
 # The converged root and the conservative exit (return 𝒢(v)) are the same for all.
 #
-# Output: probe_<suffix>.csv, one row per step and variant.
+# Output: probe_<suffix>.csv, one row per step and variant; the log also gives the
+# wall time of one full map and one cheap map, to turn the counts into cost.
 
 include(joinpath(@__DIR__, "..", "main.jl"))
 using Printf, Random, Serialization, Statistics
@@ -188,12 +194,93 @@ function local_preconditioner(J)
     return Pc, nfix
 end
 
+
+# G_eff at the midpoint of (v0, u), exactly as picard_map!'s Landau branch builds it,
+# but without the pair sum. Own scratch, so it can run inside the outer iteration.
+const gbuf = (; m = z(), dv = z(), dS = z(), Gb = z(), f = zeros(ws.n_dofs),
+    r = zeros(ws.n_dofs), L = zeros(ws.n_dofs))
+function geff!(Ge, u, v0, S0)
+    b = gbuf
+    @. b.m = 0.5 * (v0 + u); @. b.dv = u - v0
+    compute_entropy_gradient!(ws, b.dS, b.m, w, b.f, b.r, b.L, b.Gb)
+    λ = 0.0
+    if P.use_gonzalez
+        Base.invokelatest(L2PROJ_FN[], ws, b.f, u, w)
+        S1 = compute_entropy(ws, build_field(ws, b.f))
+        dd = sum(b.dv .* b.dS); n2 = sum(abs2, b.dv)
+        λ = n2 > 1e-30 ? (S1 - S0 - dd) / n2 : 0.0
+    end
+    @. Ge = -(b.dS + λ * b.dv) / w
+    return Ge
+end
+
+# Generic Anderson for the inner solve (same m, damping and regularisation as
+# step_anderson!); stops when ‖map(u) − u‖ < tol. Returns the evaluation count.
+function anderson_inner!(mapf!, u, tol, maxit)
+    m = P.m_anderson; β = P.damping
+    Fu = z(); r = z(); rp = z(); Fp = z(); uold = z()
+    dF = zeros(2N, m); dG = zeros(2N, m); hist = 0; slot = 0
+    for k in 1:maxit
+        uold .= u
+        mapf!(Fu, u); @. r = Fu - u
+        norm(r) < tol && (u .= Fu; return k)
+        if k == 1
+            @. u = β * Fu + (1 - β) * uold
+        else
+            slot = mod1(slot + 1, m); hist = min(hist + 1, m)
+            @views dF[:, slot] .= vec(r) .- vec(rp)
+            @views dG[:, slot] .= vec(Fu) .- vec(Fp)
+            Fv = @view dF[:, 1:hist]; Gw = @view dG[:, 1:hist]
+            AtA = Fv' * Fv
+            λ2 = 1e-10 * sum(AtA[j, j] for j in 1:hist) / hist + 1e-30
+            for j in 1:hist
+                AtA[j, j] += λ2
+            end
+            u .= Fu; mul!(vec(u), Gw, AtA \ (Fv' * vec(r)), -1.0, 1.0)
+            @. u = β * u + (1 - β) * uold
+        end
+        rp .= r; Fp .= Fu
+    end
+    return maxit
+end
+
+# Defect correction with the frozen-metric map as inner solver (see the header).
+function solve_dc!(v1, v0, S0; eta = 0.05, max_outer = 60, max_inner = 60)
+    Ak = zeros(N, 3); Bk = z(); ck = z(); Gt = z(); Ge = z(); mk = z()
+    inner = 0; nrm0 = 0.0; nrm_best = Inf; v_best = copy(v1)
+    for k in 1:max_outer
+        pmap!(Gt, v1, v0, S0)                       # full map at v_k
+        nrm = sqrt(sum(abs2, Gt .- v1)); k == 1 && (nrm0 = nrm)
+        nrm < nrm_best && (nrm_best = nrm; v_best .= Gt)
+        if nrm < max(P.tol * (norm(v1) + 1e-30), P.abs_floor)
+            v1 .= Gt
+            return k, nrm, nrm0, inner
+        end
+        @. mk = 0.5 * (v0 + v1)
+        geff!(Ge, v1, v0, S0)
+        collision_tensor!(Ak, Bk, ws, mk, w, Ge)
+        phi0!(out, u) = begin
+            geff!(Ge, u, v0, S0)
+            @inbounds for a in 1:N
+                out[a, 1] = v0[a, 1] + P.DT * (Bk[a, 1] - Ak[a, 1] * Ge[a, 1] - Ak[a, 2] * Ge[a, 2])
+                out[a, 2] = v0[a, 2] + P.DT * (Bk[a, 2] - Ak[a, 2] * Ge[a, 1] - Ak[a, 3] * Ge[a, 2])
+            end
+            out
+        end
+        phi0!(ck, v1); @. ck = Gt - ck               # Φ_k(v_k) = 𝒢(v_k)
+        phi!(out, u) = (phi0!(out, u); out .+= ck)
+        inner += anderson_inner!(phi!, v1, max(eta * nrm, 0.5 * P.abs_floor), max_inner)
+    end
+    v1 .= v_best
+    return max_outer, nrm_best, nrm0, inner
+end
+
 dist(a, b) = sqrt(sum(abs2, a .- b))
 
 # ---- main loop ----------------------------------------------------------------------------
 out = "probe_$(P.suffix).csv"
 io = open(out, "w")
-println(io, "step,variant,iter,r0,residual,decades,extra_map_evals")
+println(io, "step,variant,iter,r0,residual,decades,extra_map_evals,inner_evals")
 Pid = zeros(N, 4); Pid[:, 1] .= 1; Pid[:, 4] .= 1
 step0 = ck.step
 for n in 1:NSTEPS
@@ -236,14 +323,20 @@ for n in 1:NSTEPS
     Pc, nfix = local_preconditioner(J)
     x = copy(vE); it, res, r0 = solve_pc!(x, v, S0, Pc)
     push!(rows, ("pc_diag", it, r0, res, 0.0, 2NPROBES + 1))
+    x = copy(vE); itD, resD, r0D, innD = solve_dc!(x, v, S0)
+    t_full = minimum(@elapsed(pmap!(Gv, vE, v, S0)) for _ in 1:3)
+    t_cheap = minimum(@elapsed(geff!(G_eff, vE, v, S0)) for _ in 1:3)
     for r in rows
-        println(io, join((step, r...), ','))
+        println(io, join((step, r..., 0), ','))
     end
+    println(io, join((step, "dc_self", itD, r0D, resD, 0.0, 0, innD), ','))
     flush(io)
 
     nJ = [sqrt(J[a, 1]^2 + J[a, 2]^2 + J[a, 3]^2 + J[a, 4]^2) for a in 1:N]
     sp = hypot.(v[:, 1], v[:, 2])
     top = sortperm(nJ; rev = true)[1:max(1, N ÷ 100)]
+    @printf("step %d  dc_self: %d full + %d cheap maps (full %.1f ms, cheap %.1f ms → %.1f full-map equivalents)\n",
+        step, itD, innD, 1e3t_full, 1e3t_cheap, itD + innD * t_cheap / t_full)
     @printf("step %d  F=B−AG rel.err %.1e  A in %.1f s | iter: %s | ‖J_γγ‖ median %.3f, p99 %.3f, max %.2f, top-1%% median |v| %.2f (all %.2f), Pc fallbacks %d\n",
         step, cons, t_A, join(("$(r[1])=$(r[2])" for r in rows), " "),
         median(nJ), quantile(nJ, 0.99), maximum(nJ), median(sp[top]), median(sp), nfix)
