@@ -140,6 +140,9 @@ end
 # step size that produced the row, so `cumsum(dt) == time` holds even when a
 # resume changes DT. Older files stored `time = step * DT`, which silently
 # rescaled the whole history whenever a resume used a different DT.
+# Columns of solver_stats_<suffix>.csv (see main.jl).
+const STATS_COLS = ["step", "iter", "inner", "t_solve", "t_step"]
+
 const CONS_COLS = ["step", "time", "entropy", "energy", "momentum_1",
     "momentum_2", "iter", "residual", "fp_minus_fs", "neg_part", "r0", "dt"]
 

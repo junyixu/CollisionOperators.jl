@@ -319,7 +319,7 @@ export evaluate_on_grid
 # mesh-independent.
 include("functions.jl")
 
-export compute_entropy, compute_r!, compute_G!, compute_collision!, l2_project!
+export compute_entropy, compute_r!, compute_G!, compute_collision!, compute_collision_metric!, l2_project!
 export eval_loggrad_at_particles!, compute_moments, compute_drift_multipliers,
        compute_LB_velocity!
 export compute_negative_part_l1, compute_fs_minus_fp_l2

@@ -236,6 +236,59 @@ function compute_collision!(ws::Workspace, dot_v, v_parts, w_parts, G)
     return nothing
 end
 
+"""
+    compute_collision_metric!(ws, dot_v, A, v_parts, w_parts, G)
+
+`compute_collision!` plus, in the same pair loop, the metric
+``A_\\gamma = \\sum_\\alpha w_\\alpha U(v_\\gamma - v_\\alpha)`` stored as `A[γ, :] =
+(A₁₁, A₁₂, A₂₂)`. Then ``\\dot v_\\gamma = B_\\gamma - A_\\gamma G_\\gamma`` with ``B`` the
+``U``-weighted sum of the other particles' ``G``: what `step_defect!` freezes. `dot_v`
+is accumulated in the same antisymmetric form as `compute_collision!`, so it is
+bit-identical to it.
+"""
+function compute_collision_metric!(ws::Workspace, dot_v, A, v_parts, w_parts, G)
+    v1_lo, v1_hi = ws.bp1[1], ws.bp1[end]
+    v2_lo, v2_hi = ws.bp2[1], ws.bp2[end]
+    fill!(dot_v, 0.0)
+    fill!(A, 0.0)
+    N = size(v_parts, 1)
+    Threads.@threads for γ in 1:N
+        vγ1, vγ2 = v_parts[γ, 1], v_parts[γ, 2]
+        (vγ1 <= v1_lo || vγ1 >= v1_hi ||
+         vγ2 <= v2_lo || vγ2 >= v2_hi) && continue
+        Gγ1, Gγ2 = G[γ, 1], G[γ, 2]
+        acc1, acc2 = 0.0, 0.0
+        a11, a12, a22 = 0.0, 0.0, 0.0
+        for α in 1:N
+            γ == α && continue
+            vα1, vα2 = v_parts[α, 1], v_parts[α, 2]
+            (vα1 <= v1_lo || vα1 >= v1_hi ||
+             vα2 <= v2_lo || vα2 >= v2_hi) && continue
+            d1 = vγ1 - vα1
+            d2 = vγ2 - vα2
+            dist2 = d1^2 + d2^2
+            dist2 < 1e-24 && continue
+            dist = sqrt(dist2)
+            g1 = G[α, 1] - Gγ1
+            g2 = G[α, 2] - Gγ2
+            dv_dot_g = (d1 * g1 + d2 * g2) / dist2
+            inv_dist = 1.0 / dist
+            acc1 += w_parts[α] * (g1 - d1 * dv_dot_g) * inv_dist
+            acc2 += w_parts[α] * (g2 - d2 * dv_dot_g) * inv_dist
+            s = w_parts[α] * inv_dist
+            a11 += s * (1 - d1 * d1 / dist2)
+            a12 -= s * d1 * d2 / dist2
+            a22 += s * (1 - d2 * d2 / dist2)
+        end
+        dot_v[γ, 1] = acc1
+        dot_v[γ, 2] = acc2
+        A[γ, 1] = a11
+        A[γ, 2] = a12
+        A[γ, 3] = a22
+    end
+    return nothing
+end
+
 # ##############################################################################
 # Diagnostics
 # ##############################################################################

@@ -43,6 +43,10 @@ function run_simulation(p::SimParameters; resume = nothing)
 
     # ---- State init: either fresh sample or resume from checkpoint ----
     cons_csv = "conservation_history_$(p.suffix).csv"
+    # Per-step solver cost: `inner` is the restart count (:anderson), Newton steps
+    # (:newton) or cheap inner maps (:defect); times in seconds, measured in process
+    # (the log is block-buffered and cannot be used for timing).
+    stats_csv = "solver_stats_$(p.suffix).csv"
     snap_csv = "particle_snapshots_$(p.suffix).csv"
     start_step = 0
     t_start = 0.0          # physical time at start_step
@@ -145,13 +149,30 @@ function run_simulation(p::SimParameters; resume = nothing)
     ΔF = zeros(2 * p.N_PARTICLES, p.m_anderson)
     ΔG = zeros(2 * p.N_PARTICLES, p.m_anderson)
 
-    p.solver in (:anderson, :newton) || error("unknown solver=$(p.solver)")
+    p.solver in (:anderson, :newton, :defect) || error("unknown solver=$(p.solver)")
+    if p.solver === :defect
+        p.collision_model == :landau || error("solver=:defect is Landau-only")
+        p.use_gpu && p.gpu_fp32 &&
+            error("solver=:defect needs the FP64 pair kernel (gpu_fp32=false)")
+    end
+    dc = p.solver === :defect ?
+         (A = zeros(p.N_PARTICLES, 3), Gk = zeros(p.N_PARTICLES, 2),
+        Φu = zeros(p.N_PARTICLES, 2)) : nothing
     nk = p.solver === :newton ? NKWorkspace(2 * p.N_PARTICLES, p.nk_krylov_max) :
          nothing
     nk_fd_h = p.nk_fd_h > 0 ? p.nk_fd_h : (p.use_gpu && p.gpu_fp32 ? 1e-5 : 1e-6)
 
     # Warm start (stateless, so a resume needs nothing from the checkpoint).
-    p.warmstart in (:euler, :nn) || error("unknown warmstart=$(p.warmstart)")
+    p.warmstart in (:euler, :nn, :frozen) || error("unknown warmstart=$(p.warmstart)")
+    if p.warmstart === :frozen
+        p.collision_model == :landau || error("warmstart=:frozen is Landau-only")
+        p.use_gpu && p.gpu_fp32 &&
+            error("warmstart=:frozen needs the FP64 pair kernel (gpu_fp32=false)")
+    end
+    # Frozen-metric start: the metric A from the predictor's pair pass and Gⁿ.
+    fz = p.warmstart === :frozen ?
+         (A = zeros(p.N_PARTICLES, 3), Gn = zeros(p.N_PARTICLES, 2),
+        Ge = zeros(p.N_PARTICLES, 2)) : nothing
     nn = p.warmstart === :nn ?
          NNWarmstart(load_warmstart_model(p.nn_weights), p.N_PARTICLES;
         cap = p.nn_cap, to_device = NN_TO_DEVICE[]) : nothing
@@ -194,6 +215,9 @@ function run_simulation(p::SimParameters; resume = nothing)
         save_fs_snapshot(ws, p.suffix, 0, f_coeffs)
         plot_fs_diagnostics(ws, f_coeffs, p.suffix, 0)
 
+        stats_io = open(stats_csv, "w")
+        println(stats_io, join(STATS_COLS, ','))
+        flush(stats_io)
         cons_io = open(cons_csv, "w")
         println(cons_io, join(CONS_COLS, ','))
         println(cons_io,
@@ -222,9 +246,17 @@ function run_simulation(p::SimParameters; resume = nothing)
         truncate_csv_after(snap_csv, start_step)
         cons_io = open(cons_csv, "a")
         snap_io = open(snap_csv, "a")
+        if isfile(stats_csv)
+            truncate_csv_after(stats_csv, start_step)
+            stats_io = open(stats_csv, "a")
+        else
+            stats_io = open(stats_csv, "w")
+            println(stats_io, join(STATS_COLS, ','))
+        end
     end
 
     for step in (start_step + 1):p.N_STEPS
+        t_step0 = time_ns()
         S0 = entropy_history[end]
 
         # Explicit predictor for the Anderson initial guess. Landau uses the
@@ -240,13 +272,32 @@ function run_simulation(p::SimParameters; resume = nothing)
             compute_r!(ws, r_vec, f_s)
             ldiv!(L_vec, ws.M_lu, r_vec)
             Base.invokelatest(COMPG_FN[], ws, G, v_particles, L_vec)
-            Base.invokelatest(COLLISION_FN[], ws, dot_v, v_particles, w_particles, G)
+            if fz === nothing
+                Base.invokelatest(COLLISION_FN[], ws, dot_v, v_particles, w_particles, G)
+            else   # same F, bit for bit, plus the metric A
+                Base.invokelatest(COLLMETRIC_FN[], ws, dot_v, fz.A, v_particles,
+                    w_particles, G)
+            end
         end
         @. v_euler = v_particles + p.DT * dot_v
         v1 .= v_euler
         if dump_io !== nothing
             dump_dotv .= dot_v
             dump_G .= G
+        end
+        # Frozen-metric start: keep A and the other particles' G at vⁿ, move each
+        # particle's own G to the Euler midpoint, v⁽⁰⁾ = v_E − Δt·A_γ(G_eff,γ − Gⁿ_γ).
+        # One G_eff evaluation (projections, no pair sum); see step_defect!.
+        if fz !== nothing
+            fz.Gn .= G
+            landau_geff!(ws, fz.Ge, v_euler, v_particles, w_particles, S0, v_mid, dv,
+                dS_mid, f_buf, r_vec, L_vec, G; use_gonzalez = p.use_gonzalez)
+            @inbounds for a in axes(v1, 1)
+                d1 = fz.Ge[a, 1] - fz.Gn[a, 1]
+                d2 = fz.Ge[a, 2] - fz.Gn[a, 2]
+                v1[a, 1] -= p.DT * (fz.A[a, 1] * d1 + fz.A[a, 2] * d2)
+                v1[a, 2] -= p.DT * (fz.A[a, 2] * d1 + fz.A[a, 3] * d2)
+            end
         end
         if nn !== nothing
             t_nn = @elapsed n_clip = nn_correct!(v1, nn, v_particles, dot_v, G,
@@ -257,7 +308,7 @@ function run_simulation(p::SimParameters; resume = nothing)
 
         # One implicit step from the guess in `v`, which leaves holding the root.
         implicit_solve!(v; verbose = false) =
-            if nk === nothing
+            if p.solver === :anderson
                 step_anderson!(ws,
                     v, v_particles, w_particles, S0, p.DT,
                     v_mid, dv, dS_mid, G_eff, dot_v, f_buf,
@@ -273,7 +324,7 @@ function run_simulation(p::SimParameters; resume = nothing)
                     use_gonzalez = p.use_gonzalez,
                     exit_picard_step = p.exit_picard_step,
                     verbose)
-            else
+            elseif p.solver === :newton
                 step_newton!(ws,
                     v, v_particles, w_particles, S0, p.DT,
                     v_mid, dv, dS_mid, G_eff, dot_v, f_buf,
@@ -283,9 +334,21 @@ function run_simulation(p::SimParameters; resume = nothing)
                     use_gonzalez = p.use_gonzalez,
                     exit_picard_step = p.exit_picard_step,
                     verbose)
+            else
+                step_defect!(ws,
+                    v, v_particles, w_particles, S0, p.DT,
+                    v_mid, dv, dS_mid, G_eff, dot_v, f_buf,
+                    r_vec, L_vec, G,
+                    Gv, r_curr, r_prev, Gv_prev, v_old_buf, ΔF, ΔG, dc.A, dc.Gk, dc.Φu;
+                    m = p.m_anderson, max_iter = p.max_iter, tol = p.tol,
+                    abs_floor = p.abs_floor, damping = p.damping,
+                    eta = p.dc_eta, max_inner = p.dc_max_inner,
+                    stag_window = p.dc_stag_window, stag_rel_tol = p.stag_rel_tol,
+                    use_gonzalez = p.use_gonzalez, verbose)
             end
         iter, res_final, n_rs, r0_init = implicit_solve!(v1;
             verbose = (step <= start_step + 3))
+        t_solve = (time_ns() - t_step0) / 1e9
 
         dump_io !== nothing &&
             write_dump_record(dump_io, step, p.DT, iter, r0_init,
@@ -350,12 +413,17 @@ function run_simulation(p::SimParameters; resume = nothing)
             # Mirror the growing conservation CSV at snapshot cadence (not every
             # step — that would spawn an rclone process per timestep).
             rclone_upload(p.suffix, cons_csv)
+            rclone_upload(p.suffix, stats_csv)
             oracle_io === nothing || rclone_upload(p.suffix, oracle_csv)
         end
 
+        println(stats_io, "$step,$iter,$n_rs,$t_solve,$((time_ns() - t_step0) / 1e9)")
+        flush(stats_io)
+
         step % 25 == 0 &&
             println("Step $step/$(p.N_STEPS)  iter=$iter  " *
-                    (nk === nothing ? "rs=" : "newton=") * "$n_rs" *
+                    (p.solver === :anderson ? "rs=" : p.solver === :newton ? "newton=" : "inner=") *
+                    "$n_rs" *
                     "  ‖r‖=$(round(res_final; sigdigits=3))" *
                     "  ‖f_s−f_p‖=$(round(fp_l2_history[end]; sigdigits=4))" *
                     "  neg=$(round(neg_history[end]; sigdigits=4))" *
@@ -366,6 +434,8 @@ function run_simulation(p::SimParameters; resume = nothing)
     # CSVs already streamed per-step / per-snapshot above. Just close.
     close(cons_io)
     close(snap_io)
+    close(stats_io)
+    rclone_upload(p.suffix, stats_csv; final = true)
     # Final mirror so the last steps (if not a multiple of 25) reach S3 too.
     rclone_upload(p.suffix, cons_csv; final = true)
     if oracle_io !== nothing
@@ -388,6 +458,7 @@ function run_simulation(p::SimParameters; resume = nothing)
         iter_history, res_history, fp_l2_history, neg_history,
         snapshots_v,
         label = (p.solver === :newton ? "Newton–Krylov" :
+                 p.solver === :defect ? "defect correction" :
                  p.use_anderson ? "Anderson(m=$(p.m_anderson))" : "Picard"))
 end
 
@@ -430,6 +501,7 @@ function enable_gpu!(p::SimParameters)
             COLLISION_FN[] = getglobal(Main, :compute_collision_gpu32!)
         else
             COLLISION_FN[] = getglobal(Main, :compute_collision_gpu!)
+            COLLMETRIC_FN[] = getglobal(Main, :compute_collision_metric_gpu!)
         end
     end
     return nothing

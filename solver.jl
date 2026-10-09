@@ -31,12 +31,14 @@ const COLLISION_FN = Ref{Any}(compute_collision!)
 const L2PROJ_FN = Ref{Any}(l2_project!)
 const COMPG_FN = Ref{Any}(compute_G!)
 const LOGGRAD_FN = Ref{Any}(eval_loggrad_at_particles!)   # LB base gradient
+const COLLMETRIC_FN = Ref{Any}(compute_collision_metric!)  # F and A, for step_defect!
 
 # A docstring before `const` attaches to that binding alone, so alias the shared
 # one onto the other three; otherwise `@ref` to them has nothing to resolve.
 @doc (@doc COLLISION_FN) L2PROJ_FN
 @doc (@doc COLLISION_FN) COMPG_FN
 @doc (@doc COLLISION_FN) LOGGRAD_FN
+@doc (@doc COLLISION_FN) COLLMETRIC_FN
 
 @doc raw"""
     compute_entropy_gradient!(ws, dS, v_parts, w_parts, f_coeffs_buf, r_vec, L_vec, G_buf)
@@ -69,6 +71,45 @@ function compute_entropy_gradient!(ws::Workspace, dS, v_parts, w_parts,
         dS[α, 2] = -w_parts[α] * G_buf[α, 2]
     end
     return nothing
+end
+
+@doc raw"""
+    landau_geff!(ws, G_eff, v_in, v0, w_parts, S0, v_mid, dv, dS_mid, f_buf, r_vec,
+                 L_vec, G_buf; use_gonzalez = true)
+
+The Landau discrete gradient ``\overline{\nabla} S`` of [`picard_map!`](@ref), as
+`G_eff = -(∇S(v_mid) + λ Δv) / w`: the FEM entropy gradient at the midpoint of `v0` and
+`v_in` plus the Gonzalez rank-one term (`λ = 0` with `use_gonzalez = false`). Sets
+`v_mid` and `dv`; everything up to the collision sum, so [`step_defect!`](@ref) can
+re-evaluate it without the pair sum.
+"""
+function landau_geff!(ws::Workspace, G_eff, v_in, v0, w_parts, S0, v_mid, dv, dS_mid,
+        f_buf, r_vec, L_vec, G_buf; use_gonzalez::Bool = true)
+    N = size(v0, 1)
+    @. v_mid = 0.5 * (v0 + v_in)
+    @. dv = v_in - v0
+    compute_entropy_gradient!(ws, dS_mid, v_mid, w_parts,
+        f_buf, r_vec, L_vec, G_buf)
+    correction = 0.0
+    if use_gonzalez
+        Base.invokelatest(L2PROJ_FN[], ws, f_buf, v_in, w_parts)
+        S1 = compute_entropy(ws, build_field(ws, f_buf))
+
+        dot_dv_dS = 0.0
+        nrm2_dv = 0.0
+        @inbounds for α in 1:N
+            dot_dv_dS += dv[α, 1] * dS_mid[α, 1] + dv[α, 2] * dS_mid[α, 2]
+            nrm2_dv += dv[α, 1]^2 + dv[α, 2]^2
+        end
+        correction = nrm2_dv > 1e-30 ? (S1 - S0 - dot_dv_dS) / nrm2_dv : 0.0
+    end
+
+    @inbounds for α in 1:N
+        inv_w = 1.0 / w_parts[α]
+        G_eff[α, 1] = -(dS_mid[α, 1] + correction * dv[α, 1]) * inv_w
+        G_eff[α, 2] = -(dS_mid[α, 2] + correction * dv[α, 2]) * inv_w
+    end
+    return G_eff
 end
 
 @doc raw"""
@@ -169,27 +210,8 @@ function picard_map!(ws::Workspace, v_out, v_in, v0, w_parts, S0, dt,
         end
     else
         # Landau: FEM-projected entropy gradient + Gonzalez discrete-grad correction.
-        compute_entropy_gradient!(ws, dS_mid, v_mid, w_parts,
-            f_buf, r_vec, L_vec, G_buf)
-        correction = 0.0
-        if use_gonzalez
-            Base.invokelatest(L2PROJ_FN[], ws, f_buf, v_in, w_parts)
-            S1 = compute_entropy(ws, build_field(ws, f_buf))
-
-            dot_dv_dS = 0.0
-            nrm2_dv = 0.0
-            @inbounds for α in 1:N
-                dot_dv_dS += dv[α, 1] * dS_mid[α, 1] + dv[α, 2] * dS_mid[α, 2]
-                nrm2_dv += dv[α, 1]^2 + dv[α, 2]^2
-            end
-            correction = nrm2_dv > 1e-30 ? (S1 - S0 - dot_dv_dS) / nrm2_dv : 0.0
-        end
-
-        @inbounds for α in 1:N
-            inv_w = 1.0 / w_parts[α]
-            G_eff[α, 1] = -(dS_mid[α, 1] + correction * dv[α, 1]) * inv_w
-            G_eff[α, 2] = -(dS_mid[α, 2] + correction * dv[α, 2]) * inv_w
-        end
+        landau_geff!(ws, G_eff, v_in, v0, w_parts, S0, v_mid, dv, dS_mid,
+            f_buf, r_vec, L_vec, G_buf; use_gonzalez)
     end
 
     # --- RHS assembly ----------------------------------------------------------
@@ -461,4 +483,152 @@ function step_newton!(ws::Workspace,
     exit_picard_step && (@. v1_v -= nk.F)
     verbose && println("    [$status]  evals=$n_evals  newton=$n_newton  ‖F‖=$nrm")
     return n_evals, nrm, n_newton, nrm0
+end
+
+# Anderson-accelerated fixed-point iteration u = map(u), with step_anderson!'s
+# window, damping and regularisation but no stagnation logic: it stops at
+# ‖map(u) − u‖ < tol or after `maxit` maps, and leaves `u` holding map(u).
+# Returns the number of map evaluations.
+function _anderson_inner!(mapf!, u, Fu, r, rp, Fp, uold, ΔF, ΔG, tol, maxit, m, damping;
+        reg_factor = 1e-10)
+    u_v, Fu_v, r_v = vec(u), vec(Fu), vec(r)
+    hist = 0
+    slot = 0
+    for k in 1:maxit
+        uold .= u
+        mapf!(Fu, u)
+        @. r = Fu - u
+        if norm(r_v) < tol
+            u .= Fu
+            return k
+        end
+        if k == 1
+            @. u = damping * Fu + (1 - damping) * uold
+        else
+            slot = mod1(slot + 1, m)
+            hist = min(hist + 1, m)
+            @views ΔF[:, slot] .= r_v .- vec(rp)
+            @views ΔG[:, slot] .= Fu_v .- vec(Fp)
+            ΔFv = @view ΔF[:, 1:hist]
+            ATA = ΔFv' * ΔFv
+            λ2 = reg_factor * sum(ATA[j, j] for j in 1:hist) / hist + 1e-30
+            for j in 1:hist
+                ATA[j, j] += λ2
+            end
+            u .= Fu
+            mul!(u_v, view(ΔG, :, 1:hist), ATA \ (ΔFv' * r_v), -1.0, 1.0)
+            @. u = damping * u + (1 - damping) * uold
+        end
+        rp .= r
+        Fp .= Fu
+    end
+    return maxit
+end
+
+@doc raw"""
+    step_defect!(ws, v1, v0, w_parts, S0, dt, v_mid, dv, dS_mid, G_eff, dot_v_buf,
+                 f_buf, r_vec, L_vec, G_buf, Gv, r_curr, r_prev, Gv_prev, v_old, ΔF, ΔG,
+                 A, Gk, Φu; m = 8, max_iter = 2000, tol = 1e-12, abs_floor = 1e-7,
+                 damping = 0.7, eta = 0.05, max_inner = 60, stag_window = 5,
+                 stag_rel_tol = 0.1, use_gonzalez = true, verbose = false)
+        -> (outer_iterations, residual, inner_iterations, initial_residual)
+
+Solve the Landau implicit step of [`step_anderson!`](@ref) by defect correction around
+a frozen metric. The collision velocity splits as
+
+```math
+\dot v_\gamma = \sum_\alpha w_\alpha U(v_\gamma - v_\alpha)(G_\alpha - G_\gamma)
+             = B_\gamma - A_\gamma G_\gamma ,
+\qquad A_\gamma = \sum_\alpha w_\alpha U(v_\gamma - v_\alpha) ,
+```
+
+where the pair sums ``A`` and ``B`` change slowly with the particle positions while the
+entropy gradient ``G`` (an ``O(N)`` projection) changes fast. Outer iteration ``k``
+evaluates the full Picard map once, ``\mathcal{G}(v_k)``, together with ``A_k`` in the
+same pair pass ([`COLLMETRIC_FN`](@ref)), and then solves the cheap map
+
+```math
+\Phi_k(u) = \mathcal{G}(v_k) - \Delta t\, A_k \bigl(G_\text{eff}(u) - G_\text{eff}(v_k)\bigr)
+```
+
+by Anderson to ``\lVert \Phi_k(u) - u \rVert < \max(\eta \lVert \mathcal{G}(v_k) - v_k \rVert,
+\texttt{abs\_floor}/2)``. ``\Phi_k(v_k) = \mathcal{G}(v_k)``, so a fixed point of the outer
+iteration is a fixed point of ``\mathcal{G}``: the root is the same as `step_anderson!`'s.
+Each ``\Phi_k`` evaluation needs ``G_\text{eff}`` ([`landau_geff!`](@ref)) but no pair sum.
+
+The stopping rule is `step_anderson!`'s on the outer residual ``\lVert \mathcal{G}(v) - v
+\rVert``, and the exit returns ``\mathcal{G}(v)`` computed with the antisymmetric pair sum,
+so momentum and energy are conserved exactly as there. Every `stag_window` outer
+iterations, a best residual that fell by less than `stag_rel_tol` ends the solve with
+the best ``\mathcal{G}(v)``. `max_iter` caps the outer iterations.
+
+Measured (N = 40k, FP64, RTX 3080 probe): 6–11 outer iterations per step against
+10–120 Anderson iterations, each ``\Phi_k`` costing about 2 % of a full map. In FP32 the
+full map is cheap and this does not pay.
+"""
+function step_defect!(ws::Workspace,
+        v1, v0, w_parts, S0, dt,
+        v_mid, dv, dS_mid, G_eff, dot_v_buf, f_buf,
+        r_vec, L_vec, G_buf,
+        Gv, r_curr, r_prev, Gv_prev, v_old, ΔF, ΔG, A, Gk, Φu;
+        m = 8, max_iter = 2000, tol = 1e-12, abs_floor = 1e-7, damping = 0.7,
+        eta = 0.05, max_inner = 60, stag_window = 5, stag_rel_tol = 0.1,
+        use_gonzalez::Bool = true, verbose = false)
+    N = size(v0, 1)
+    nrm0 = 0.0
+    nrm_best = Inf
+    nrm_best_window = Inf
+    v_best = copy(v1)
+    inner = 0
+
+    # Φ_k(u) = 𝒢(v_k) − Δt A_k (G_eff(u) − G_k); Gv holds 𝒢(v_k), Gk holds G_k.
+    function frozen_map!(out, u)
+        landau_geff!(ws, G_eff, u, v0, w_parts, S0, v_mid, dv, dS_mid,
+            f_buf, r_vec, L_vec, G_buf; use_gonzalez)
+        @inbounds for a in 1:N
+            d1 = G_eff[a, 1] - Gk[a, 1]
+            d2 = G_eff[a, 2] - Gk[a, 2]
+            out[a, 1] = Gv[a, 1] - dt * (A[a, 1] * d1 + A[a, 2] * d2)
+            out[a, 2] = Gv[a, 2] - dt * (A[a, 2] * d1 + A[a, 3] * d2)
+        end
+        return out
+    end
+
+    for k in 1:max_iter
+        landau_geff!(ws, G_eff, v1, v0, w_parts, S0, v_mid, dv, dS_mid,
+            f_buf, r_vec, L_vec, G_buf; use_gonzalez)
+        Base.invokelatest(COLLMETRIC_FN[], ws, dot_v_buf, A, v_mid, w_parts, G_eff)
+        @. Gv = v0 + dt * dot_v_buf
+        @. r_curr = Gv - v1
+        nrm = norm(r_curr)
+        k == 1 && (nrm0 = nrm)
+        if nrm < nrm_best
+            nrm_best = nrm
+            v_best .= Gv
+        end
+
+        if nrm < max(tol * (norm(v1) + 1e-30), abs_floor)
+            v1 .= Gv
+            verbose && println("    outer k=$k  ‖r‖=$nrm  inner=$inner  [converged]")
+            return k, nrm, inner, nrm0
+        end
+        if k > stag_window && k % stag_window == 0
+            if (nrm_best_window - nrm_best) / (nrm_best_window + 1e-30) < stag_rel_tol
+                v1 .= v_best
+                verbose && println("    outer k=$k  stagnated  nrm_best=$nrm_best")
+                return k, nrm_best, inner, nrm0
+            end
+            nrm_best_window = nrm_best
+        end
+
+        Gk .= G_eff
+        n_in = _anderson_inner!(frozen_map!, v1, Φu, r_curr, r_prev, Gv_prev, v_old,
+            ΔF, ΔG, max(eta * nrm, 0.5 * abs_floor), max_inner, m, damping)
+        inner += n_in
+        verbose && println("    outer k=$k  ‖r‖=$nrm  inner +$n_in")
+    end
+
+    v1 .= v_best
+    @warn "Defect correction did not converge" max_iter tol abs_floor nrm0 nrm_best inner
+    return max_iter, nrm_best, inner, nrm0
 end

@@ -278,3 +278,123 @@ function compute_collision_gpu!(ws::Workspace, dot_v, v_parts, w_parts, G)
     end
     return nothing
 end
+
+# ---- F and the metric A in one pass (solver = :defect) ------------------------
+# `_landau_partial!` plus A_γ = Σ_α w_α U(v_γ − v_α) (3 entries). F is accumulated
+# exactly as there, so it is bit-identical to compute_collision_gpu!; the extra
+# cost is three FMA chains per pair and three more partial arrays.
+
+function _landau_metric_partial!(p1, p2, q11, q12, q22, v1, v2, g1, g2, w, N, S,
+        lo1, hi1, lo2, hi2)
+    tid = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    tid > N * S && return nothing
+    γ = (tid - 1) % N + 1
+    s = (tid - 1) ÷ N + 1
+    @inbounds begin
+        vγ1 = v1[γ]
+        vγ2 = v2[γ]
+        if vγ1 <= lo1 || vγ1 >= hi1 || vγ2 <= lo2 || vγ2 >= hi2
+            p1[tid] = 0.0; p2[tid] = 0.0
+            q11[tid] = 0.0; q12[tid] = 0.0; q22[tid] = 0.0
+            return nothing
+        end
+        chunk = cld(N, S)
+        αlo = (s - 1) * chunk + 1
+        αhi = min(s * chunk, N)
+        Gγ1 = g1[γ]
+        Gγ2 = g2[γ]
+        acc1 = 0.0
+        acc2 = 0.0
+        a11 = 0.0
+        a12 = 0.0
+        a22 = 0.0
+        for α in αlo:αhi
+            vα1 = v1[α]
+            vα2 = v2[α]
+            if vα1 <= lo1 || vα1 >= hi1 || vα2 <= lo2 || vα2 >= hi2
+                continue
+            end
+            d1 = vγ1 - vα1
+            d2 = vγ2 - vα2
+            dist2 = d1 * d1 + d2 * d2
+            dist2 < 1e-24 && continue
+            gg1 = g1[α] - Gγ1
+            gg2 = g2[α] - Gγ2
+            inv_dist = _rsqrt64(dist2)
+            inv_d2 = inv_dist * inv_dist
+            dv_dot_g = (d1 * gg1 + d2 * gg2) * inv_d2
+            acc1 += w[α] * (gg1 - d1 * dv_dot_g) * inv_dist
+            acc2 += w[α] * (gg2 - d2 * dv_dot_g) * inv_dist
+            sw = w[α] * inv_dist
+            a11 += sw * (1.0 - d1 * d1 * inv_d2)
+            a12 -= sw * d1 * d2 * inv_d2
+            a22 += sw * (1.0 - d2 * d2 * inv_d2)
+        end
+        p1[tid] = acc1; p2[tid] = acc2
+        q11[tid] = a11; q12[tid] = a12; q22[tid] = a22
+    end
+    return nothing
+end
+
+function _reduce_partial1!(o, p, N, S)
+    γ = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    γ > N && return nothing
+    @inbounds begin
+        a = 0.0
+        for s in 1:S
+            a += p[(s - 1) * N + γ]
+        end
+        o[γ] = a
+    end
+    return nothing
+end
+
+mutable struct GpuMetricBuf
+    N::Int
+    q11::CuVector{Float64}
+    q12::CuVector{Float64}
+    q22::CuVector{Float64}   # N×_SLICES partials of A
+    a11::CuVector{Float64}
+    a12::CuVector{Float64}
+    a22::CuVector{Float64}
+end
+
+const _GPU_MBUF = Ref{Union{Nothing, GpuMetricBuf}}(nothing)
+
+function _gpu_mbuf(N::Int)
+    b = _GPU_MBUF[]
+    if b === nothing || b.N != N
+        b = GpuMetricBuf(N, CUDA.zeros(Float64, N * _SLICES), CUDA.zeros(Float64, N * _SLICES),
+            CUDA.zeros(Float64, N * _SLICES),
+            CUDA.zeros(Float64, N), CUDA.zeros(Float64, N), CUDA.zeros(Float64, N))
+        _GPU_MBUF[] = b
+    end
+    return b
+end
+
+function compute_collision_metric_gpu!(ws::Workspace, dot_v, A, v_parts, w_parts, G)
+    N = size(v_parts, 1)
+    b = _gpu_buf(N)
+    m = _gpu_mbuf(N)
+    _upload_col!(b.v1, v_parts, 1, b.h)
+    _upload_col!(b.v2, v_parts, 2, b.h)
+    _upload_col!(b.g1, G, 1, b.h)
+    _upload_col!(b.g2, G, 2, b.h)
+    copyto!(b.w, w_parts)
+    @cuda threads=_TPB blocks=cld(N*_SLICES, _TPB) _landau_metric_partial!(
+        b.p1, b.p2, m.q11, m.q12, m.q22, b.v1, b.v2, b.g1, b.g2, b.w, N, _SLICES,
+        ws.bp1[1], ws.bp1[end], ws.bp2[1], ws.bp2[end])
+    @cuda threads=256 blocks=cld(N, 256) _reduce_partials!(
+        b.o1, b.o2, b.p1, b.p2, N, _SLICES)
+    @cuda threads=256 blocks=cld(N, 256) _reduce_partials!(
+        m.a11, m.a12, m.q11, m.q12, N, _SLICES)
+    @cuda threads=256 blocks=cld(N, 256) _reduce_partial1!(m.a22, m.q22, N, _SLICES)
+    for (dst, col, src) in ((dot_v, 1, b.o1), (dot_v, 2, b.o2),
+                            (A, 1, m.a11), (A, 2, m.a12), (A, 3, m.a22))
+        copyto!(b.h, src)
+        @inbounds for i in 1:N
+            dst[i, col] = b.h[i]
+        end
+    end
+    return nothing
+end

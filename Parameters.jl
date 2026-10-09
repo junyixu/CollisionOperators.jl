@@ -81,6 +81,13 @@ Base.@kwdef struct SimParameters
     # `abs_floor` and `max_iter` (a cap on Picard-map evaluations), and both log
     # evaluations in the `iter` column, so runs compare one-to-one.
     solver::Symbol = :anderson
+    # :defect = defect correction around a frozen metric (`step_defect!`, Landau
+    # only, FP64 pair kernel): `iter` then counts full maps (outer iterations) and
+    # solver_stats_<suffix>.csv the cheap inner maps. Pays off where the pair sum
+    # dominates the cost (FP64 on consumer GPUs), not in FP32.
+    dc_eta::Float64 = 0.05         # inner tolerance, relative to the outer residual
+    dc_max_inner::Int = 60         # cap on inner maps per outer iteration
+    dc_stag_window::Int = 5        # outer iterations between stagnation checks
     nk_krylov_max::Int = 30        # GMRES basis size per Newton step
     nk_eta_max::Float64 = 0.9      # Eisenstat–Walker forcing-term cap
     # Absolute finite-difference step for J·u (the probe moves by exactly this).
@@ -97,9 +104,11 @@ Base.@kwdef struct SimParameters
     # order in ‖F‖; 3–10x worse energy drift in the FP32 A/B). Keep true.
     exit_picard_step::Bool = true
 
-    # Initial guess of the implicit solve (warmstart.jl): :euler = explicit Euler
-    # predictor; :nn = Euler + Δt²·δ̂ from the MLP in `nn_weights`, each particle's
-    # correction clipped to `nn_cap` × the mean Euler step ‖Δt·v̇‖.
+    # Initial guess of the implicit solve: :euler = explicit Euler predictor;
+    # :nn = Euler + Δt²·δ̂ from the MLP in `nn_weights` (warmstart.jl), each
+    # particle's correction clipped to `nn_cap` × the mean Euler step ‖Δt·v̇‖;
+    # :frozen = Euler with each particle's own entropy gradient moved to the Euler
+    # midpoint under a frozen metric (Landau, FP64 pair kernel; see main.jl).
     warmstart::Symbol = :euler
     nn_weights::String = ""
     nn_cap::Float64 = 3.0
