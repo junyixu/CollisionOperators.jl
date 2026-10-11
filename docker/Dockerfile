@@ -5,6 +5,10 @@
 # On top of that, a root-only dev environment (neovim + plugins, zsh, yazi, …)
 # for editing and inspecting runs on pods reachable only via the SSH proxy.
 #
+# All stages are archlinux:base and every tool comes from pacman, except Julia,
+# which is juliaup-bin from the AUR. The base tag is not pinned: a rebuild that
+# misses the layer cache picks up whatever the Arch repos ship that day.
+#
 # Build (context = repository root):
 #   docker build -f docker/Dockerfile -t ghcr.io/junyixu/collisionoperators .
 #
@@ -13,28 +17,33 @@
 #   cd /root/CollisionOperators.jl && git pull
 #   julia main.jl parameters_LB_sq_d04.jl --use_gpu=true ...
 
+# ---- juliaup (AUR build stage) ----------------------------------------------
+# makepkg refuses to run as root: build juliaup-bin as a throwaway user here and
+# hand only the package file to the runtime stage, so the final image carries
+# neither base-devel nor a sudo-capable build user. The glob skips the -debug
+# split package that makepkg may emit.
+FROM archlinux:base AS aur
+RUN pacman -Syu --noconfirm --needed base-devel git \
+ && useradd -m builder \
+ && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+USER builder
+RUN git clone --depth=1 https://aur.archlinux.org/juliaup-bin.git ~/juliaup-bin \
+ && cd ~/juliaup-bin \
+ && makepkg -sir --noconfirm \
+ && mkdir ~/pkg && cp juliaup-bin-[0-9]*.pkg.tar.zst ~/pkg/
+
 # ---- dev tools (build stage) -------------------------------------------------
-# Same Ubuntu release as runpod/base, so the binaries and compiled treesitter
-# parsers run unchanged in the final stage. Built as root (HOME=/root): the
-# configs and plugin caches are copied to the same paths in the final stage.
-FROM ubuntu:24.04 AS devtools
-ARG NVIM_VERSION=v0.12.5
+# Same distro as the runtime stage, so the compiled treesitter parsers and
+# plugin libraries run unchanged there. Built as root (HOME=/root): the configs
+# and plugin caches are copied to the same paths in the final stage. nodejs is
+# for `tree-sitter generate` (the latex grammar ships no parser.c); eza / atuin /
+# yazi are on PATH for the first zsh start below, as in the runtime image.
+FROM archlinux:base AS devtools
 ARG PARSERS="bash c diff html lua luadoc markdown markdown_inline query vim vimdoc python yaml latex typst"
-ENV DEBIAN_FRONTEND=noninteractive HOME=/root
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git gcc make libc6-dev nodejs npm unzip zsh \
- && npm i -g tree-sitter-cli \
- && curl -fsSL https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-x86_64.tar.gz | tar -xz -C /opt \
- && mv /opt/nvim-linux-x86_64 /opt/nvim
-# extra CLI tools: eza / atuin / yazi from release binaries
-RUN set -eux; cd /tmp; B=/opt/bin; mkdir -p $B; \
-    base() { echo "https://github.com/$1/releases/latest/download/$2"; }; \
-    curl -fsSL "$(base eza-community/eza eza_x86_64-unknown-linux-gnu.tar.gz)" | tar -xz -C $B; \
-    curl -fsSL "$(base atuinsh/atuin atuin-x86_64-unknown-linux-gnu.tar.gz)" | tar -xz -C /tmp; \
-    cp "$(find /tmp -name atuin -type f | head -1)" $B/atuin; \
-    curl -fsSL -o y.zip "$(base sxyazi/yazi yazi-x86_64-unknown-linux-gnu.zip)"; \
-    unzip -j y.zip '*/yazi' '*/ya' -d $B; chmod +x $B/*
-ENV PATH=/opt/nvim/bin:/opt/bin:/root/.local/bin:$PATH
+ENV HOME=/root PATH=/root/.local/bin:$PATH
+RUN pacman -Syu --noconfirm --needed \
+      ca-certificates curl git gcc make nodejs unzip zsh neovim tree-sitter-cli eza atuin yazi \
+ && rm -rf /var/cache/pacman/pkg/*
 # Configs come straight from public GitHub repos. The *_REV args are cache
 # busters only: the Docker workflow passes each branch's current commit, so a
 # config push invalidates its layer (and everything after it in this stage).
@@ -82,8 +91,7 @@ RUN find ~/.local/share/nvim/lazy ~/.local/share/zinit -path '*/lazy/blink.cmp/.
  && find ~/.local/share/nvim/lazy ~/.local/share/zinit/plugins -mindepth 2 -maxdepth 2 -type d \( -name test -o -name tests \) -prune -exec rm -rf {} +
 
 # ---- runtime image -------------------------------------------------------------
-# Runpod's base image: its default CMD starts sshd from the PUBLIC_KEY env var.
-FROM runpod/base:1.0.2-ubuntu2404
+FROM archlinux:base
 
 ARG JULIA_VERSION=1.12.7
 
@@ -92,16 +100,20 @@ ARG JULIA_VERSION=1.12.7
 # CPU the pod lands on instead of being recompiled at first `using`.
 ENV JULIA_DEPOT_PATH=/opt/julia-depot \
     JULIA_PROJECT=/opt/collisionops-env \
-    JULIA_CPU_TARGET="generic;sandybridge,-xsaveopt,clone_all;haswell,-rdrnd,base(1);x86-64-v4,-rdrnd,base(1)" \
-    PATH=/opt/julia/bin:$PATH
+    JULIA_CPU_TARGET="generic;sandybridge,-xsaveopt,clone_all;haswell,-rdrnd,base(1);x86-64-v4,-rdrnd,base(1)"
 
-RUN apt-get update && apt-get install -y --no-install-recommends unzip \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL https://rclone.org/install.sh | bash \
-    && curl -fsSL "https://julialang-s3.julialang.org/bin/linux/x64/${JULIA_VERSION%.*}/julia-${JULIA_VERSION}-linux-x86_64.tar.gz" \
-    | tar -xz -C /opt \
-    && mv "/opt/julia-${JULIA_VERSION}" /opt/julia \
-    && julia --version
+# juliaup keeps its own state in ~/.julia/juliaup (it ignores JULIA_DEPOT_PATH).
+# Exactly one Julia in the image: no version picked from manifests, no
+# versions-db refresh in the background of every `julia` start.
+COPY --from=aur /home/builder/pkg/ /tmp/pkg/
+RUN pacman -Syu --noconfirm \
+ && pacman -U --noconfirm /tmp/pkg/*.pkg.tar.zst \
+ && rm -rf /tmp/pkg /var/cache/pacman/pkg/* \
+ && juliaup add "${JULIA_VERSION}" \
+ && juliaup default "${JULIA_VERSION}" \
+ && juliaup config manifestversiondetect false \
+ && juliaup config versionsdbupdateinterval 0 \
+ && julia --version
 
 # Dependencies first, so a code-only change reuses this (slow) layer.
 COPY docker/Project.toml docker/Manifest.toml docker/LocalPreferences.toml $JULIA_PROJECT/
@@ -118,17 +130,15 @@ RUN julia -e 'using Pkg; Pkg.instantiate(); Pkg.precompile(; strict = true)' \
 # was fastest for the Anderson least-squares on a 12-vCPU RTX 4090 pod.
 ENV OPENBLAS_NUM_THREADS=1
 
-# Dev tools: runtime packages here, the built nvim / CLI tools / configs from the
-# devtools stage. Root only — sshd and authorized_keys stay with runpod/base.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      git zsh tmux fzf zoxide direnv bat ripgrep fd-find file less ncurses-term kitty-terminfo \
-      universal-ctags global htop \
- && ln -sf /usr/bin/batcat /usr/local/bin/bat && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
+# Dev tools and pod services: packages here, nvim plugins / zsh plugins /
+# configs from the devtools stage. Root only. python3 is for the cuInit smoke
+# test run right after a pod boots.
+RUN pacman -Syu --noconfirm --needed \
+      openssh git zsh tmux fzf zoxide direnv bat ripgrep fd file less kitty-terminfo \
+      ctags global htop eza atuin yazi neovim rclone python \
+ && rm -rf /var/cache/pacman/pkg/* \
  && usermod -s /usr/bin/zsh root \
- && rm -rf /var/lib/apt/lists/*
-COPY --from=devtools /opt/nvim /opt/nvim
-COPY --from=devtools /opt/bin/ /usr/local/bin/
-RUN ln -s /opt/nvim/bin/nvim /usr/local/bin/nvim
+ && echo 'LANG=C.UTF-8' > /etc/locale.conf
 COPY --from=devtools /root/.config /root/.config
 COPY --from=devtools /root/.local /root/.local
 COPY --from=devtools /root/.zshrc /root/.zshrc
@@ -136,12 +146,11 @@ COPY --from=devtools /root/.cache /root/.cache
 
 # Image ENV reaches only PID 1, not SSH sessions: replay it for login shells
 # (/etc/profile.d) and for every zsh, including `ssh pod 'cmd'` (/etc/zsh/zshenv;
-# zsh on Ubuntu does not read /etc/profile).
+# zsh reads /etc/profile only as a login shell).
 RUN { echo "export JULIA_DEPOT_PATH='$JULIA_DEPOT_PATH'"; \
       echo "export JULIA_PROJECT='$JULIA_PROJECT'"; \
       echo "export JULIA_CPU_TARGET='$JULIA_CPU_TARGET'"; \
       echo "export OPENBLAS_NUM_THREADS='$OPENBLAS_NUM_THREADS'"; \
-      echo 'case ":$PATH:" in *:/opt/julia/bin:*) ;; *) export PATH="/opt/julia/bin:$PATH" ;; esac'; \
     } > /etc/profile.d/julia.sh \
  && echo '[ -r /etc/profile.d/julia.sh ] && emulate sh -c ". /etc/profile.d/julia.sh"' >> /etc/zsh/zshenv
 
@@ -150,8 +159,9 @@ RUN { echo "export JULIA_DEPOT_PATH='$JULIA_DEPOT_PATH'"; \
 # with E1568). Fix those up and switch to zsh. A direct SSH session goes through
 # sshd with the client's TERM and lands in zsh, so it never hits this.
 # /start.sh appends `source /etc/rp_environment` to .bashrc at boot, after this
-# block, so load it here before exec'ing zsh.
-RUN cat >> /root/.bashrc <<'EOF'
+# block, so load it here before exec'ing zsh. Arch's /root has no dotfiles, so
+# also add the .bash_profile that makes a login bash read .bashrc.
+RUN echo '[[ -f ~/.bashrc ]] && . ~/.bashrc' > /root/.bash_profile && cat >> /root/.bashrc <<'EOF'
 
 # Runpod SSH proxy session → 256-color TERM, UTF-8, nvim without tty queries, zsh
 if [[ $- == *i* && $TERM == xterm ]]; then
@@ -160,6 +170,11 @@ if [[ $- == *i* && $TERM == xterm ]]; then
     exec zsh -l
 fi
 EOF
+
+# Pod entrypoint in place of runpod/base's: sshd from PUBLIC_KEY, pod env for
+# SSH sessions, then idle.
+COPY --chmod=755 docker/start.sh /start.sh
+CMD ["/start.sh"]
 
 COPY . /root/CollisionOperators.jl
 WORKDIR /root/CollisionOperators.jl

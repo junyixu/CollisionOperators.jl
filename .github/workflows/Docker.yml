@@ -1,6 +1,8 @@
 # Build the precompiled GPU image (docker/Dockerfile) and push it to GHCR.
 # Pods pull ghcr.io/<owner>/collisionoperators instead of installing and
-# precompiling Julia packages at boot.
+# precompiling Julia packages at boot. main publishes :latest (what the Runpod
+# template pulls); a feat/docker-<name> branch publishes :<name> to test on a
+# pod first.
 
 name: Docker
 
@@ -8,6 +10,7 @@ on:
     push:
         branches:
             - main
+            - feat/docker-*
         paths:
             - docker/**
             - .github/workflows/Docker.yml
@@ -50,6 +53,8 @@ jobs:
                   echo "zsh=$(rev zsh-config-public main)" >> "$GITHUB_OUTPUT"
                   echo "yazi=$(rev yazi-config-public main)" >> "$GITHUB_OUTPUT"
                   echo "repo_owner=$(echo ${{ github.repository_owner }} | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+                  if [ "$GITHUB_REF_NAME" = main ]; then tag=latest; else tag=${GITHUB_REF_NAME#feat/docker-}; tag=${tag//\//-}; fi
+                  echo "tag=$tag" >> "$GITHUB_OUTPUT"
             - uses: docker/build-push-action@v6
               with:
                   context: .
@@ -60,7 +65,7 @@ jobs:
                       ZSH_REV=${{ steps.rev.outputs.zsh }}
                       YAZI_REV=${{ steps.rev.outputs.yazi }}
                   tags: |
-                      ghcr.io/${{ steps.rev.outputs.repo_owner }}/collisionoperators:latest
+                      ghcr.io/${{ steps.rev.outputs.repo_owner }}/collisionoperators:${{ steps.rev.outputs.tag }}
                       ghcr.io/${{ steps.rev.outputs.repo_owner }}/collisionoperators:${{ github.sha }}
                   cache-from: type=gha
                   cache-to: type=gha,mode=max,ignore-error=true
