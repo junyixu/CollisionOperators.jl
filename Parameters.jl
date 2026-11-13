@@ -89,6 +89,8 @@ Base.@kwdef struct SimParameters
     dc_eta::Float64 = 0.05         # inner tolerance, relative to the outer residual
     dc_max_inner::Int = 60         # cap on inner maps per outer iteration
     dc_stag_window::Int = 5        # outer iterations between stagnation checks
+    # Anderson depth of the outer defect-correction loop; 0 = plain Richardson.
+    dc_outer_m::Int = 0
     nk_krylov_max::Int = 30        # GMRES basis size per Newton step
     nk_eta_max::Float64 = 0.9      # Eisenstat–Walker forcing-term cap
     # Absolute finite-difference step for J·u (the probe moves by exactly this).
@@ -99,6 +101,18 @@ Base.@kwdef struct SimParameters
     # Legacy relative step h = nk_fd_rel·‖v‖; > 0 overrides nk_fd_h. Only for
     # reproducing the first runs (√eps·‖v‖ ≈ 0.1 in FP32, far too large).
     nk_fd_rel::Float64 = 0.0
+    # true = FP64 residual, finite-difference Jacobian products with the FP32
+    # pair sum (:newton and :gs_nk; needs use_gpu=true, gpu_fp32=false). `iter`
+    # then counts FP64 maps and solver_stats' `inner` the FP32 maps.
+    nk_jvp32::Bool = false
+    # Solvers built on GeometricSolvers.jl (gs_solvers.jl, loaded on demand; needs
+    # Julia 1.13 and the package in the environment):
+    #   :gs_nk       Newton + GMRES with our finite-difference product
+    #   :gs_anderson Anderson(Picard) on the residual of the Picard map
+    #   :gs_npc      LeftPreconditioned(outer, frozen-metric solve): outer is
+    #                Anderson(Picard, gs_m), or plain Picard for gs_m = 0
+    gs_m::Int = 4                  # Anderson depth of :gs_anderson / :gs_npc
+    gs_eta::Float64 = 0.0          # :gs_nk forcing: > 0 fixed, 0 = Eisenstat–Walker 2
     # true = both solvers return G(v), one final Picard update of the accepted
     # iterate v: momentum is then conserved exactly and energy to O(Δt‖F‖).
     # false = return v itself (smaller residual, but conservation errors first

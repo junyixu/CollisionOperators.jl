@@ -32,6 +32,9 @@ const L2PROJ_FN = Ref{Any}(l2_project!)
 const COMPG_FN = Ref{Any}(compute_G!)
 const LOGGRAD_FN = Ref{Any}(eval_loggrad_at_particles!)   # LB base gradient
 const COLLMETRIC_FN = Ref{Any}(compute_collision_metric!)  # F and A, for step_defect!
+# FP32 pair sum for mixed-precision Jacobian products (`nk_jvp32`); the CPU has no
+# FP32 kernel, so there it is the FP64 loop and only the code path is exercised.
+const COLLISION32_FN = Ref{Any}(compute_collision!)
 
 # A docstring before `const` attaches to that binding alone, so alias the shared
 # one onto the other three; otherwise `@ref` to them has nothing to resolve.
@@ -39,6 +42,7 @@ const COLLMETRIC_FN = Ref{Any}(compute_collision_metric!)  # F and A, for step_d
 @doc (@doc COLLISION_FN) COMPG_FN
 @doc (@doc COLLISION_FN) LOGGRAD_FN
 @doc (@doc COLLISION_FN) COLLMETRIC_FN
+@doc (@doc COLLISION_FN) COLLISION32_FN
 
 @doc raw"""
     compute_entropy_gradient!(ws, dS, v_parts, w_parts, f_coeffs_buf, r_vec, L_vec, G_buf)
@@ -171,11 +175,16 @@ guarded by a ``10^{-30}`` floor.
   discrete-gradient identity holds for *any* base gradient, so Gonzalez only adds
   the rank-one ``\lambda`` term on top.
 
+`collision_fn` replaces the Landau pair sum for this call, which is how the
+mixed-precision solvers evaluate the same map with the FP32 kernel
+([`COLLISION32_FN`](@ref)).
+
 Writes `v_out` in place; every other array argument is scratch.
 """
 function picard_map!(ws::Workspace, v_out, v_in, v0, w_parts, S0, dt,
         v_mid, dv, dS_mid, G_eff, dot_v_buf, f_buf,
-        r_vec, L_vec, G_buf; use_gonzalez::Bool = true)
+        r_vec, L_vec, G_buf; use_gonzalez::Bool = true,
+        collision_fn = COLLISION_FN[])
     N = size(v0, 1)
     is_lb = ws.p.collision_model == :lb
     @. v_mid = 0.5 * (v0 + v_in)
@@ -220,7 +229,7 @@ function picard_map!(ws::Workspace, v_out, v_in, v0, w_parts, S0, dt,
         A1, A2, B = compute_drift_multipliers(v_mid, w_parts, G_eff, n, U1, U2, Q)
         compute_LB_velocity!(dot_v_buf, v_mid, G_eff, A1, A2, B, ws.p.nu)
     else
-        Base.invokelatest(COLLISION_FN[], ws, dot_v_buf, v_mid, w_parts, G_eff)
+        Base.invokelatest(collision_fn, ws, dot_v_buf, v_mid, w_parts, G_eff)
     end
     @. v_out = v0 + dt * dot_v_buf
     return nothing
@@ -454,6 +463,11 @@ The finite-difference step is the absolute `fd_h` (see [`newton_krylov!`](@ref))
 `fd_rel > 0` overrides it with the earlier relative scaling
 ``h = \texttt{fd\_rel}\cdot\max(\lVert v \rVert, 1)``, for reproducing old runs.
 
+With `jvp32 = true` the residual stays in FP64 and only the finite-difference
+Jacobian products use the FP32 pair sum ([`COLLISION32_FN`](@ref)): a defect
+correction in precision. `n_evals` then counts the FP64 maps alone and the third
+slot the FP32 maps.
+
 Returns `(n_evals, ‖F‖, n_newton, ‖F₀‖)`; the third slot is the restart count in
 `step_anderson!`.
 """
@@ -463,7 +477,7 @@ function step_newton!(ws::Workspace,
         r_vec, L_vec, G_buf, Gv, nk::NKWorkspace;
         max_iter = 1000, tol = 1e-12, abs_floor = 1e-7, fd_h = 1e-5,
         fd_rel = 0.0, eta_max = 0.9, verbose = false, use_gonzalez::Bool = true,
-        exit_picard_step::Bool = true)
+        exit_picard_step::Bool = true, jvp32::Bool = false)
     N = size(v0, 1)
     Gv_v = vec(Gv)
     function residual!(F, v)
@@ -473,16 +487,26 @@ function step_newton!(ws::Workspace,
         @. F = v - Gv_v
         return F
     end
+    # The same residual with the FP32 pair sum, for the Jacobian products only.
+    function residual32!(F, v)
+        picard_map!(ws, Gv, reshape(v, N, 2), v0, w_parts, S0, dt,
+            v_mid, dv, dS_mid, G_eff, dot_v_buf, f_buf,
+            r_vec, L_vec, G_buf; use_gonzalez = use_gonzalez,
+            collision_fn = COLLISION32_FN[])
+        @. F = v - Gv_v
+        return F
+    end
 
     v1_v = vec(v1)
     eff_tol = max(tol * (norm(v1_v) + 1e-30), abs_floor)
     h = fd_rel > 0 ? fd_rel * max(norm(v1_v), 1.0) : fd_h
-    n_evals, nrm, n_newton, nrm0, status = newton_krylov!(v1_v, residual!, nk;
+    n_evals, nrm, n_newton, nrm0, status, n_jvp = newton_krylov!(v1_v, residual!, nk;
         tol = eff_tol, max_evals = max_iter, fd_h = h,
-        eta_max = eta_max, verbose = verbose)
+        eta_max = eta_max, verbose = verbose,
+        Fjvp! = jvp32 ? residual32! : nothing)
     exit_picard_step && (@. v1_v -= nk.F)
-    verbose && println("    [$status]  evals=$n_evals  newton=$n_newton  ‖F‖=$nrm")
-    return n_evals, nrm, n_newton, nrm0
+    verbose && println("    [$status]  evals=$n_evals  jvp32=$n_jvp  newton=$n_newton  ‖F‖=$nrm")
+    return n_evals, nrm, (jvp32 ? n_jvp : n_newton), nrm0
 end
 
 # Anderson-accelerated fixed-point iteration u = map(u), with step_anderson!'s
@@ -525,6 +549,17 @@ function _anderson_inner!(mapf!, u, Fu, r, rp, Fp, uold, ΔF, ΔG, tol, maxit, m
     return maxit
 end
 
+"""
+    defect_outer_workspace(N, m)
+
+Buffers for the Anderson-accelerated outer loop of [`step_defect!`](@ref) on `N`
+particles with history depth `m`.
+"""
+function defect_outer_workspace(N::Integer, m::Integer)
+    return (ΔW = zeros(2N, m), ΔU = zeros(2N, m), w = zeros(2N), w_prev = zeros(2N),
+        u_prev = zeros(2N), x = zeros(N, 2), has_prev = Ref(false))
+end
+
 @doc raw"""
     step_defect!(ws, v1, v0, w_parts, S0, dt, v_mid, dv, dS_mid, G_eff, dot_v_buf,
                  f_buf, r_vec, L_vec, G_buf, Gv, r_curr, r_prev, Gv_prev, v_old, ΔF, ΔG,
@@ -562,6 +597,10 @@ so momentum and energy are conserved exactly as there. Every `stag_window` outer
 iterations, a best residual that fell by less than `stag_rel_tol` ends the solve with
 the best ``\mathcal{G}(v)``. `max_iter` caps the outer iterations.
 
+`outer`, a workspace from [`defect_outer_workspace`](@ref), accelerates the outer
+iteration with Anderson on ``v \mapsto N(v)``, where ``N(v)`` is the frozen-metric solve
+from ``v``; `nothing` is the plain Richardson iteration ``v_{k+1} = N(v_k)``.
+
 Measured (N = 40k, FP64, RTX 3080 probe): 6–11 outer iterations per step against
 10–120 Anderson iterations, each ``\Phi_k`` costing about 2 % of a full map. In FP32 the
 full map is cheap and this does not pay.
@@ -573,13 +612,19 @@ function step_defect!(ws::Workspace,
         Gv, r_curr, r_prev, Gv_prev, v_old, ΔF, ΔG, A, Gk, Φu;
         m = 8, max_iter = 2000, tol = 1e-12, abs_floor = 1e-7, damping = 0.7,
         eta = 0.05, max_inner = 60, stag_window = 5, stag_rel_tol = 0.1,
-        use_gonzalez::Bool = true, verbose = false)
+        use_gonzalez::Bool = true, verbose = false, outer = nothing)
     N = size(v0, 1)
     nrm0 = 0.0
     nrm_best = Inf
     nrm_best_window = Inf
     v_best = copy(v1)
     inner = 0
+    # Anderson on the outer iteration v ↦ N(v), N the frozen-metric solve from v:
+    # ring buffers of the differences of w = N(v) − v and of N(v).
+    o_hist = 0
+    o_slot = 0
+    o_m = outer === nothing ? 0 : size(outer.ΔW, 2)
+    nrm_prev = Inf
 
     # Φ_k(u) = 𝒢(v_k) − Δt A_k (G_eff(u) − G_k); Gv holds 𝒢(v_k), Gk holds G_k.
     function frozen_map!(out, u)
@@ -594,6 +639,7 @@ function step_defect!(ws::Workspace,
         return out
     end
 
+    o_m > 0 && (outer.has_prev[] = false)
     for k in 1:max_iter
         landau_geff!(ws, G_eff, v1, v0, w_parts, S0, v_mid, dv, dS_mid,
             f_buf, r_vec, L_vec, G_buf; use_gonzalez)
@@ -622,10 +668,40 @@ function step_defect!(ws::Workspace,
         end
 
         Gk .= G_eff
+        o_m > 0 && (outer.x .= v1)
         n_in = _anderson_inner!(frozen_map!, v1, Φu, r_curr, r_prev, Gv_prev, v_old,
             ΔF, ΔG, max(eta * nrm, 0.5 * abs_floor), max_inner, m, damping)
         inner += n_in
         verbose && println("    outer k=$k  ‖r‖=$nrm  inner +$n_in")
+
+        if o_m > 0
+            # v1 holds N(x). A residual that grew drops the history.
+            if nrm > 2 * nrm_prev
+                o_hist = 0
+                o_slot = 0
+            end
+            nrm_prev = nrm
+            x_v, u_v = vec(outer.x), vec(v1)
+            @. outer.w = u_v - x_v
+            if outer.has_prev[]
+                o_slot = mod1(o_slot + 1, o_m)
+                o_hist = min(o_hist + 1, o_m)
+                @views outer.ΔW[:, o_slot] .= outer.w .- outer.w_prev
+                @views outer.ΔU[:, o_slot] .= u_v .- outer.u_prev
+            end
+            outer.w_prev .= outer.w
+            outer.u_prev .= u_v
+            outer.has_prev[] = true
+            if o_hist > 0
+                ΔWv = @view outer.ΔW[:, 1:o_hist]
+                WTW = ΔWv' * ΔWv
+                λ2 = 1e-10 * sum(WTW[j, j] for j in 1:o_hist) / o_hist + 1e-30
+                for j in 1:o_hist
+                    WTW[j, j] += λ2
+                end
+                mul!(u_v, view(outer.ΔU, :, 1:o_hist), WTW \ (ΔWv' * outer.w), -1.0, 1.0)
+            end
+        end
     end
 
     v1 .= v_best

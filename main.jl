@@ -148,18 +148,31 @@ function run_simulation(p::SimParameters; resume = nothing)
     ΔF = zeros(2 * p.N_PARTICLES, p.m_anderson)
     ΔG = zeros(2 * p.N_PARTICLES, p.m_anderson)
 
-    p.solver in (:anderson, :newton, :defect) || error("unknown solver=$(p.solver)")
-    if p.solver === :defect
-        p.collision_model == :landau || error("solver=:defect is Landau-only")
+    is_gs = p.solver in (:gs_nk, :gs_anderson, :gs_npc)
+    p.solver in (:anderson, :newton, :defect) || is_gs || error("unknown solver=$(p.solver)")
+    if p.solver in (:defect, :gs_npc)
+        p.collision_model == :landau || error("solver=$(p.solver) is Landau-only")
         p.use_gpu && p.gpu_fp32 &&
-            error("solver=:defect needs the FP64 pair kernel (gpu_fp32=false)")
+            error("solver=$(p.solver) needs the FP64 pair kernel (gpu_fp32=false)")
     end
-    dc = p.solver === :defect ?
+    if p.nk_jvp32
+        p.solver in (:newton, :gs_nk) || error("nk_jvp32 needs solver=:newton or :gs_nk")
+        p.collision_model == :landau || error("nk_jvp32 is Landau-only")
+        p.use_gpu && p.gpu_fp32 && error("nk_jvp32 needs the FP64 pair kernel (gpu_fp32=false)")
+    end
+    dc = p.solver in (:defect, :gs_npc) ?
          (A = zeros(p.N_PARTICLES, 3), Gk = zeros(p.N_PARTICLES, 2),
         Φu = zeros(p.N_PARTICLES, 2)) : nothing
+    dc_outer = p.solver === :defect && p.dc_outer_m > 0 ?
+               defect_outer_workspace(p.N_PARTICLES, p.dc_outer_m) : nothing
     nk = p.solver === :newton ? NKWorkspace(2 * p.N_PARTICLES, p.nk_krylov_max) :
          nothing
-    nk_fd_h = p.nk_fd_h > 0 ? p.nk_fd_h : (p.use_gpu && p.gpu_fp32 ? 1e-5 : 1e-6)
+    nk_fd_h = p.nk_fd_h > 0 ? p.nk_fd_h :
+              (p.use_gpu && (p.gpu_fp32 || p.nk_jvp32) ? 1e-5 : 1e-6)
+    gs = is_gs ?
+         Base.invokelatest(getglobal(Main, :gs_setup), ws, p, nk_fd_h,
+        (; v_mid, dv, dS_mid, G_eff, dot_v, f_buf, r_vec, L_vec, G,
+            Gv, r_curr, r_prev, Gv_prev, v_old_buf, ΔF, ΔG), dc) : nothing
 
     # NN warm start (stateless — resume-safe without checkpoint changes).
     p.warmstart in (:euler, :nn) || error("unknown warmstart=$(p.warmstart)")
@@ -277,8 +290,11 @@ function run_simulation(p::SimParameters; resume = nothing)
                 max_iter = p.max_iter, tol = p.tol, abs_floor = p.abs_floor,
                 fd_h = nk_fd_h, fd_rel = p.nk_fd_rel, eta_max = p.nk_eta_max,
                 use_gonzalez = p.use_gonzalez,
-                exit_picard_step = p.exit_picard_step,
+                exit_picard_step = p.exit_picard_step, jvp32 = p.nk_jvp32,
                 verbose = (step <= start_step + 3))
+        elseif is_gs
+            Base.invokelatest(getglobal(Main, :gs_step!), gs, v1, v_particles,
+                w_particles, S0, p.DT; verbose = (step <= start_step + 3))
         else
             step_defect!(ws,
                 v1, v_particles, w_particles, S0, p.DT,
@@ -289,7 +305,7 @@ function run_simulation(p::SimParameters; resume = nothing)
                 abs_floor = p.abs_floor, damping = p.damping,
                 eta = p.dc_eta, max_inner = p.dc_max_inner,
                 stag_window = p.dc_stag_window, stag_rel_tol = p.stag_rel_tol,
-                use_gonzalez = p.use_gonzalez,
+                use_gonzalez = p.use_gonzalez, outer = dc_outer,
                 verbose = (step <= start_step + 3))
         end
         t_solve = (time_ns() - t_step0) / 1e9
@@ -347,7 +363,8 @@ function run_simulation(p::SimParameters; resume = nothing)
 
         step % 25 == 0 &&
             println("Step $step/$(p.N_STEPS)  iter=$iter  " *
-                    (p.solver === :anderson ? "rs=" : p.solver === :newton ? "newton=" : "inner=") *
+                    (p.solver === :anderson ? "rs=" :
+                     p.solver === :newton && !p.nk_jvp32 ? "newton=" : "inner=") *
                     "$n_rs" *
                     "  ‖r‖=$(round(res_final; sigdigits=3))" *
                     "  ‖f_s−f_p‖=$(round(fp_l2_history[end]; sigdigits=4))" *
@@ -377,6 +394,7 @@ function run_simulation(p::SimParameters; resume = nothing)
         snapshots_v,
         label = (p.solver === :newton ? "Newton–Krylov" :
                  p.solver === :defect ? "defect correction" :
+                 is_gs ? "GeometricSolvers $(p.solver)" :
                  p.use_anderson ? "Anderson(m=$(p.m_anderson))" : "Picard"))
 end
 
@@ -416,8 +434,9 @@ function enable_gpu!(p::SimParameters)
             COLLISION_FN[] = getglobal(Main, :compute_collision_gpu32!)
         else
             COLLISION_FN[] = getglobal(Main, :compute_collision_gpu!)
-        COLLMETRIC_FN[] = getglobal(Main, :compute_collision_metric_gpu!)
+            COLLMETRIC_FN[] = getglobal(Main, :compute_collision_metric_gpu!)
         end
+        COLLISION32_FN[] = getglobal(Main, :compute_collision_gpu32!)
     end
     return nothing
 end
@@ -453,6 +472,9 @@ function main(args = ARGS)
     p = parse_overrides(params_loaded::SimParameters, overrides)
 
     p.use_gpu && enable_gpu!(p)
+    # GeometricSolvers.jl is loaded only for the solvers built on it.
+    p.solver in (:gs_nk, :gs_anderson, :gs_npc) &&
+        include(joinpath(@__DIR__, "gs_solvers.jl"))
 
     params_file = "params_$(p.suffix).jl"
     save_params(params_file, p)
