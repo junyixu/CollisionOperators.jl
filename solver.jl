@@ -32,9 +32,12 @@ const L2PROJ_FN = Ref{Any}(l2_project!)
 const COMPG_FN = Ref{Any}(compute_G!)
 const LOGGRAD_FN = Ref{Any}(eval_loggrad_at_particles!)   # LB base gradient
 const COLLMETRIC_FN = Ref{Any}(compute_collision_metric!)  # F and A, for step_defect!
-# FP32 pair sum for mixed-precision Jacobian products (`nk_jvp32`); the CPU has no
-# FP32 kernel, so there it is the FP64 loop and only the code path is exercised.
+# FP32 pair sum and the tangents of the pair sum, for the Jacobian products of
+# `nk_jvp`. The CPU has no FP32 kernels, so there they are the FP64 loops and only
+# the code path is exercised.
 const COLLISION32_FN = Ref{Any}(compute_collision!)
+const COLLTANGENT32_FN = Ref{Any}(compute_collision_tangent!)
+const COLLTANGENT64_FN = Ref{Any}(compute_collision_tangent!)
 
 # A docstring before `const` attaches to that binding alone, so alias the shared
 # one onto the other three; otherwise `@ref` to them has nothing to resolve.
@@ -43,6 +46,8 @@ const COLLISION32_FN = Ref{Any}(compute_collision!)
 @doc (@doc COLLISION_FN) LOGGRAD_FN
 @doc (@doc COLLISION_FN) COLLMETRIC_FN
 @doc (@doc COLLISION_FN) COLLISION32_FN
+@doc (@doc COLLISION_FN) COLLTANGENT32_FN
+@doc (@doc COLLISION_FN) COLLTANGENT64_FN
 
 @doc raw"""
     compute_entropy_gradient!(ws, dS, v_parts, w_parts, f_coeffs_buf, r_vec, L_vec, G_buf)
@@ -431,6 +436,80 @@ function step_anderson!(ws::Workspace,
     return max_iter, nrm_best, n_restart, nrm_r0
 end
 
+"""
+    jvp_workspace(N)
+
+Buffers for [`picard_jvp!`](@ref) on `N` particles. `has[]` marks the base point as
+current; clear it whenever `v0` or `S0` change (once per time step).
+"""
+function jvp_workspace(N::Integer)
+    return (x = zeros(2N), Gb = zeros(N, 2), vmb = zeros(N, 2), G1 = zeros(N, 2),
+        xp = zeros(N, 2), e = zeros(N, 2), δG = zeros(N, 2), T = zeros(N, 2),
+        Gvb = zeros(N, 2), has = Ref(false))
+end
+
+@doc raw"""
+    picard_jvp!(ws, y, x, u, jw, mode, v0, w_parts, S0, dt, v_mid, dv, dS_mid, G_eff,
+                dot_v_buf, f_buf, r_vec, L_vec, G_buf; fd_h, use_gonzalez = true)
+
+The product ``y = (I - \partial\mathcal{G}/\partial v)\,u`` at `x` for the Landau Picard
+map ``\mathcal{G}(v) = v_0 + \Delta t\, \dot v(v_\text{mid}, G_\text{eff}(v))``, without a
+second FP64 pair sum. `mode` selects how:
+
+- `:tan32`, `:tan64` — the chain rule
+  ``\partial\mathcal{G}\,u = \Delta t\,\bigl[\partial_{v}\dot v \cdot \tfrac12 u
+  + \dot v(v_\text{mid}, \delta G)\bigr]`` with the analytic tangent of the pair sum
+  ([`compute_collision_tangent!`](@ref), in FP32 or FP64) and
+  ``\delta G = (G_\text{eff}(x + h u) - G_\text{eff}(x))/h`` by a forward difference of the
+  ``O(N)`` projection chain in FP64. One product costs one [`landau_geff!`](@ref) and
+  one tangent pair pass.
+- `:fd32` — the forward difference of the whole map with the FP32 pair sum at both
+  points. Kept as the negative result it is: the probe ``h u`` is below the FP32
+  resolution of the positions, so the product is too noisy for Newton to converge.
+
+`h = fd_h / ‖u‖`, so the probe moves by `fd_h`. The base point is cached in `jw`.
+"""
+function picard_jvp!(ws::Workspace, y, x, u, jw, mode::Symbol, v0, w_parts, S0, dt,
+        v_mid, dv, dS_mid, G_eff, dot_v_buf, f_buf, r_vec, L_vec, G_buf;
+        fd_h, use_gonzalez::Bool = true)
+    N = size(v0, 1)
+    nu = norm(u)
+    if nu == 0
+        fill!(y, 0.0)
+        return y
+    end
+    h = fd_h / nu
+    if !(jw.has[] && x == jw.x)
+        if mode === :fd32
+            picard_map!(ws, jw.Gvb, reshape(x, N, 2), v0, w_parts, S0, dt, v_mid, dv,
+                dS_mid, G_eff, dot_v_buf, f_buf, r_vec, L_vec, G_buf;
+                use_gonzalez, collision_fn = COLLISION32_FN[])
+        else
+            landau_geff!(ws, jw.Gb, reshape(x, N, 2), v0, w_parts, S0, v_mid, dv, dS_mid,
+                f_buf, r_vec, L_vec, G_buf; use_gonzalez)
+            jw.vmb .= v_mid
+        end
+        copyto!(jw.x, x)
+        jw.has[] = true
+    end
+    vec(jw.xp) .= x .+ h .* u
+    if mode === :fd32
+        picard_map!(ws, jw.T, jw.xp, v0, w_parts, S0, dt, v_mid, dv, dS_mid, G_eff,
+            dot_v_buf, f_buf, r_vec, L_vec, G_buf; use_gonzalez,
+            collision_fn = COLLISION32_FN[])
+        y .= u .- (vec(jw.T) .- vec(jw.Gvb)) ./ h
+    else
+        landau_geff!(ws, jw.G1, jw.xp, v0, w_parts, S0, v_mid, dv, dS_mid,
+            f_buf, r_vec, L_vec, G_buf; use_gonzalez)
+        @. jw.δG = (jw.G1 - jw.Gb) / h
+        vec(jw.e) .= 0.5 .* u
+        Base.invokelatest(mode === :tan32 ? COLLTANGENT32_FN[] : COLLTANGENT64_FN[],
+            ws, jw.T, jw.vmb, w_parts, jw.Gb, jw.e, jw.δG)
+        y .= u .- dt .* vec(jw.T)
+    end
+    return y
+end
+
 @doc raw"""
     step_newton!(ws, v1, v0, w_parts, S0, dt, ..., Gv, nk::NKWorkspace;
                  max_iter = 1000, tol = 1e-12, abs_floor = 1e-7, fd_h = 1e-5,
@@ -463,10 +542,9 @@ The finite-difference step is the absolute `fd_h` (see [`newton_krylov!`](@ref))
 `fd_rel > 0` overrides it with the earlier relative scaling
 ``h = \texttt{fd\_rel}\cdot\max(\lVert v \rVert, 1)``, for reproducing old runs.
 
-With `jvp32 = true` the residual stays in FP64 and only the finite-difference
-Jacobian products use the FP32 pair sum ([`COLLISION32_FN`](@ref)): a defect
-correction in precision. `n_evals` then counts the FP64 maps alone and the third
-slot the FP32 maps.
+With `jvp` other than `:fd` the residual stays in FP64 and the Jacobian products come
+from [`picard_jvp!`](@ref) (`:tan32`, `:tan64`, `:fd32`) with the workspace `jw`:
+`n_evals` then counts the FP64 maps alone and the third slot the products.
 
 Returns `(n_evals, ‖F‖, n_newton, ‖F₀‖)`; the third slot is the restart count in
 `step_anderson!`.
@@ -477,7 +555,7 @@ function step_newton!(ws::Workspace,
         r_vec, L_vec, G_buf, Gv, nk::NKWorkspace;
         max_iter = 1000, tol = 1e-12, abs_floor = 1e-7, fd_h = 1e-5,
         fd_rel = 0.0, eta_max = 0.9, verbose = false, use_gonzalez::Bool = true,
-        exit_picard_step::Bool = true, jvp32::Bool = false)
+        exit_picard_step::Bool = true, jvp::Symbol = :fd, jw = nothing)
     N = size(v0, 1)
     Gv_v = vec(Gv)
     function residual!(F, v)
@@ -487,15 +565,11 @@ function step_newton!(ws::Workspace,
         @. F = v - Gv_v
         return F
     end
-    # The same residual with the FP32 pair sum, for the Jacobian products only.
-    function residual32!(F, v)
-        picard_map!(ws, Gv, reshape(v, N, 2), v0, w_parts, S0, dt,
-            v_mid, dv, dS_mid, G_eff, dot_v_buf, f_buf,
-            r_vec, L_vec, G_buf; use_gonzalez = use_gonzalez,
-            collision_fn = COLLISION32_FN[])
-        @. F = v - Gv_v
-        return F
-    end
+    # A product that needs no FP64 pair sum (`jvp` other than `:fd`).
+    jw !== nothing && (jw.has[] = false)
+    Jv!(y, x, u) = picard_jvp!(ws, y, x, u, jw, jvp, v0, w_parts, S0, dt,
+        v_mid, dv, dS_mid, G_eff, dot_v_buf, f_buf, r_vec, L_vec, G_buf;
+        fd_h = fd_h, use_gonzalez = use_gonzalez)
 
     v1_v = vec(v1)
     eff_tol = max(tol * (norm(v1_v) + 1e-30), abs_floor)
@@ -503,10 +577,10 @@ function step_newton!(ws::Workspace,
     n_evals, nrm, n_newton, nrm0, status, n_jvp = newton_krylov!(v1_v, residual!, nk;
         tol = eff_tol, max_evals = max_iter, fd_h = h,
         eta_max = eta_max, verbose = verbose,
-        Fjvp! = jvp32 ? residual32! : nothing)
+        Jv! = jvp === :fd ? nothing : Jv!)
     exit_picard_step && (@. v1_v -= nk.F)
-    verbose && println("    [$status]  evals=$n_evals  jvp32=$n_jvp  newton=$n_newton  ‖F‖=$nrm")
-    return n_evals, nrm, (jvp32 ? n_jvp : n_newton), nrm0
+    verbose && println("    [$status]  evals=$n_evals  jvp=$n_jvp  newton=$n_newton  ‖F‖=$nrm")
+    return n_evals, nrm, (jvp === :fd ? n_newton : n_jvp), nrm0
 end
 
 # Anderson-accelerated fixed-point iteration u = map(u), with step_anderson!'s

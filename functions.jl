@@ -289,6 +289,69 @@ function compute_collision_metric!(ws::Workspace, dot_v, A, v_parts, w_parts, G)
     return nothing
 end
 
+@doc raw"""
+    compute_collision_tangent!(ws, out, v_parts, w_parts, G, e, δG)
+
+The directional derivative of the Landau pair sum of `compute_collision!` at
+`(v_parts, G)` along `(e, δG)`:
+
+```math
+\delta\dot v_\gamma = \sum_\alpha w_\alpha \bigl[\, U(d)\,\delta g + \delta U(d; \epsilon)\, g \,\bigr],
+\qquad d = v_\gamma - v_\alpha,\quad g = G_\alpha - G_\gamma,\quad
+\epsilon = e_\gamma - e_\alpha,\quad \delta g = \delta G_\alpha - \delta G_\gamma ,
+```
+
+```math
+\delta U(d; \epsilon)\, g = \lvert d\rvert^{-3}\Bigl[ -g\,(d\cdot\epsilon) - \epsilon\,(d\cdot g)
+  - d\,(\epsilon\cdot g) + 3\, d\,(d\cdot g)(d\cdot\epsilon)/\lvert d\rvert^{2} \Bigr] .
+```
+
+The masks of the pair sum are held fixed. Every input is ``O(1)``, so the result
+keeps the relative accuracy of the arithmetic at any size of the direction,
+which a difference of two pair sums in low precision does not.
+"""
+function compute_collision_tangent!(ws::Workspace, out, v_parts, w_parts, G, e, δG)
+    v1_lo, v1_hi = ws.bp1[1], ws.bp1[end]
+    v2_lo, v2_hi = ws.bp2[1], ws.bp2[end]
+    fill!(out, 0.0)
+    N = size(v_parts, 1)
+    Threads.@threads for γ in 1:N
+        vγ1, vγ2 = v_parts[γ, 1], v_parts[γ, 2]
+        (vγ1 <= v1_lo || vγ1 >= v1_hi ||
+         vγ2 <= v2_lo || vγ2 >= v2_hi) && continue
+        acc1, acc2 = 0.0, 0.0
+        for α in 1:N
+            γ == α && continue
+            vα1, vα2 = v_parts[α, 1], v_parts[α, 2]
+            (vα1 <= v1_lo || vα1 >= v1_hi ||
+             vα2 <= v2_lo || vα2 >= v2_hi) && continue
+            d1 = vγ1 - vα1
+            d2 = vγ2 - vα2
+            dist2 = d1^2 + d2^2
+            dist2 < 1e-24 && continue
+            inv = 1.0 / sqrt(dist2)
+            inv2 = inv * inv
+            g1 = G[α, 1] - G[γ, 1]
+            g2 = G[α, 2] - G[γ, 2]
+            h1 = δG[α, 1] - δG[γ, 1]
+            h2 = δG[α, 2] - δG[γ, 2]
+            ε1 = e[γ, 1] - e[α, 1]
+            ε2 = e[γ, 2] - e[α, 2]
+            dg = d1 * g1 + d2 * g2
+            dε = d1 * ε1 + d2 * ε2
+            εg = ε1 * g1 + ε2 * g2
+            dh = (d1 * h1 + d2 * h2) * inv2
+            c = 3.0 * dg * dε * inv2 - εg
+            s = w_parts[α] * inv
+            acc1 += s * (h1 - d1 * dh + inv2 * (c * d1 - g1 * dε - ε1 * dg))
+            acc2 += s * (h2 - d2 * dh + inv2 * (c * d2 - g2 * dε - ε2 * dg))
+        end
+        out[γ, 1] = acc1
+        out[γ, 2] = acc2
+    end
+    return nothing
+end
+
 # ##############################################################################
 # Diagnostics
 # ##############################################################################

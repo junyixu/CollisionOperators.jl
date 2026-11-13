@@ -6,9 +6,9 @@
 # All three solve F(v) = v − 𝒢(v) = 0 for the Picard map 𝒢 of solver.jl, with the
 # stopping rule and the conservative exit 𝒢(v) of `step_anderson!`:
 #
-#   :gs_nk        Newton(linsolve = GMRES, jacobian = JVPFunction): our forward
-#                 difference as the product, in FP64 or, with `nk_jvp32`, through the
-#                 FP32 pair sum while the residual stays in FP64.
+#   :gs_nk        Newton(linsolve = GMRES, jacobian = JVPFunction): the product is
+#                 `nk_jvp`, the forward difference of the FP64 map or `picard_jvp!`
+#                 (FP32 or FP64 tangent of the pair sum); the residual stays in FP64.
 #   :gs_anderson  Anderson(Picard(damping), gs_m) on F.
 #   :gs_npc       LeftPreconditioned(outer, FrozenMetric()): the frozen-metric solve
 #                 of `step_defect!` as a nonlinear left preconditioner. The outer is
@@ -27,13 +27,13 @@ const GS = GeometricSolvers
 
 Everything a GeometricSolvers solve of one time step needs, passed to it as the
 parameters `p`: the workspace and scratch arrays of [`picard_map!`](@ref), the step
-data (`v0`, `w`, `S0`, `dt`), single-entry caches of the last FP64 map, FP32 map and
+data (`v0`, `w`, `S0`, `dt`), single-entry caches of the last FP64 map and
 frozen-metric solve, and the evaluation counters.
 
 The caches matter for `LeftPreconditioned`, which asks for the global residual and
 the inner step at the same point more than once per iteration.
 """
-mutable struct GSContext{W, B, D}
+mutable struct GSContext{W, B, D, J}
     ws::W
     N::Int
     buf::B                    # scratch arrays of main.jl's time loop
@@ -48,23 +48,20 @@ mutable struct GSContext{W, B, D}
     x64::Vector{Float64}
     G64::Matrix{Float64}
     has64::Bool
-    # last FP32 map (baseline of the Jacobian product)
-    x32::Vector{Float64}
-    G32::Matrix{Float64}
-    has32::Bool
-    xp::Vector{Float64}       # difference probe and its map
+    xp::Vector{Float64}       # difference probe and its map (:fd)
     Gp::Matrix{Float64}
+    jw::J                     # workspace of picard_jvp! (or nothing)
     # last frozen-metric solve: N(xN) in uN
     xN::Vector{Float64}
     uN::Matrix{Float64}
     hasN::Bool
     # counters of the current step
     n64::Int
-    n32::Int
+    n_jvp::Int
     n_inner::Int
     nrm0::Float64
     # settings
-    jvp32::Bool
+    jvp::Symbol
     fd_h::Float64
     eta::Float64
     max_inner::Int
@@ -92,16 +89,6 @@ function gs_map64!(c::GSContext, out::Matrix{Float64}, x; metric::Bool = false)
     return out
 end
 
-# 𝒢(x) with the FP32 pair sum, uncached.
-function gs_map32!(c::GSContext, out::Matrix{Float64}, x)
-    b = c.buf
-    picard_map!(c.ws, out, reshape(x, c.N, 2), c.v0, c.w, c.S0, c.dt, b.v_mid, b.dv,
-        b.dS_mid, b.G_eff, b.dot_v, b.f_buf, b.r_vec, b.L_vec, b.G;
-        use_gonzalez = c.use_gonzalez, collision_fn = COLLISION32_FN[])
-    c.n32 += 1
-    return out
-end
-
 # Make the FP64 cache hold x.
 function gs_full64!(c::GSContext, x)
     c.has64 && x == c.x64 && return nothing
@@ -119,9 +106,16 @@ function gs_residual!(r, x, c::GSContext)
     return r
 end
 
-# J v for J = I − ∂𝒢/∂x by a forward difference that moves the probe by `fd_h`, as in
-# `newton_krylov!`. With `jvp32` both points come from the FP32 map.
+# J v for J = I − ∂𝒢/∂x: `picard_jvp!`, or for `:fd` the forward difference of the FP64
+# map that moves the probe by `fd_h`, as in `newton_krylov!`.
 function gs_jvp!(Jv, x, v, c::GSContext)
+    c.n_jvp += 1
+    b = c.buf
+    if c.jvp !== :fd
+        return picard_jvp!(c.ws, Jv, x, v, c.jw, c.jvp, c.v0, c.w, c.S0, c.dt, b.v_mid,
+            b.dv, b.dS_mid, b.G_eff, b.dot_v, b.f_buf, b.r_vec, b.L_vec, b.G;
+            fd_h = c.fd_h, use_gonzalez = c.use_gonzalez)
+    end
     nv = norm(v)
     if nv == 0
         fill!(Jv, 0.0)
@@ -129,19 +123,9 @@ function gs_jvp!(Jv, x, v, c::GSContext)
     end
     h = c.fd_h / nv
     @. c.xp = x + h * v
-    if c.jvp32
-        if !(c.has32 && x == c.x32)
-            gs_map32!(c, c.G32, x)
-            copyto!(c.x32, x)
-            c.has32 = true
-        end
-        gs_map32!(c, c.Gp, c.xp)
-        Jv .= v .- (vec(c.Gp) .- vec(c.G32)) ./ h
-    else
-        gs_full64!(c, x)
-        gs_map64!(c, c.Gp, c.xp)
-        Jv .= v .- (vec(c.Gp) .- vec(c.G64)) ./ h
-    end
+    gs_full64!(c, x)
+    gs_map64!(c, c.Gp, c.xp)
+    Jv .= v .- (vec(c.Gp) .- vec(c.G64)) ./ h
     return Jv
 end
 
@@ -214,21 +198,21 @@ end
 # ---- setup and the per-step driver --------------------------------------------
 
 """
-    gs_setup(ws, p, fd_h, buf, dc)
+    gs_setup(ws, p, fd_h, buf, dc, jw)
 
 Build the GeometricSolvers problem, method and solver state for `p.solver`, once per
 run. `buf` holds the scratch arrays of the time loop and `dc` the frozen-metric arrays
 (`nothing` unless `:gs_npc`). Returns what [`gs_step!`](@ref) takes.
 """
-function gs_setup(ws, p, fd_h, buf, dc)
+function gs_setup(ws, p, fd_h, buf, dc, jw)
     N = p.N_PARTICLES
     z() = zeros(2N)
     Z() = zeros(N, 2)
     c = GSContext(ws, N, buf, dc, Z(), zeros(N), 0.0, p.DT, p.use_gonzalez,
         p.solver === :gs_npc,
-        z(), Z(), false, z(), Z(), false, z(), Z(), z(), Z(), false,
+        z(), Z(), false, z(), Z(), jw, z(), Z(), false,
         0, 0, 0, 0.0,
-        p.nk_jvp32, fd_h, p.dc_eta, p.dc_max_inner, p.m_anderson, p.damping, p.abs_floor)
+        p.nk_jvp, fd_h, p.dc_eta, p.dc_max_inner, p.m_anderson, p.damping, p.abs_floor)
 
     # Anderson and Picard prepare a derivative of a problem without a Jacobian by AD,
     # which the GPU kernels cannot take; none of the methods here reads it.
@@ -248,8 +232,7 @@ function gs_setup(ws, p, fd_h, buf, dc)
     println("GeometricSolvers $(pkgversion(GeometricSolvers)): ", method)
     solver = GS.init(prob, z(), method, c; f_abstol = p.abs_floor, f_reltol = 0.0)
     return (; c, solver, tol = p.tol, abs_floor = p.abs_floor, max_iter = p.max_iter,
-        exit_picard_step = p.exit_picard_step, npc = p.solver === :gs_npc,
-        jvp32 = p.nk_jvp32)
+        exit_picard_step = p.exit_picard_step, npc = p.solver === :gs_npc)
 end
 
 """
@@ -260,7 +243,7 @@ Solve one implicit step with the GeometricSolvers method of [`gs_setup`](@ref), 
 predictor in `v1`, to `step_anderson!`'s target ``\\max(\\texttt{tol}\\,\\lVert v\\rVert,
 \\texttt{abs\\_floor})`` on ``\\lVert\\mathcal{G}(v) - v\\rVert``. `v1` leaves holding
 ``\\mathcal{G}(v)`` (the conservative exit) unless `exit_picard_step` is off. `inner`
-counts the frozen-metric maps (`:gs_npc`), the FP32 maps (`nk_jvp32`) or is 0.
+counts the frozen-metric maps (`:gs_npc`) or the Jacobian products (`:gs_nk`).
 """
 function gs_step!(gs, v1, v0, w, S0, dt; verbose::Bool = false)
     c = gs.c
@@ -268,8 +251,9 @@ function gs_step!(gs, v1, v0, w, S0, dt; verbose::Bool = false)
     c.w .= w
     c.S0 = S0
     c.dt = dt
-    c.has64 = c.has32 = c.hasN = false
-    c.n64 = c.n32 = c.n_inner = 0
+    c.has64 = c.hasN = false
+    c.jw !== nothing && (c.jw.has[] = false)
+    c.n64 = c.n_jvp = c.n_inner = 0
     c.nrm0 = 0.0
 
     x = vec(v1)
@@ -286,7 +270,7 @@ function gs_step!(gs, v1, v0, w, S0, dt; verbose::Bool = false)
     gs_full64!(c, x)
     nrm = sqrt(sum(abs2(a - g) for (a, g) in zip(x, c.G64)))
     gs.exit_picard_step && copyto!(x, c.G64)
-    inner = gs.npc ? c.n_inner : c.n32
+    inner = gs.npc ? c.n_inner : c.n_jvp
     (verbose || status.code != SUCCESS) &&
         println("    [gs $(status.code)]  it=$(status.iterations)  fp64=$(c.n64)  " *
                 "inner=$inner  ‖F‖=$nrm  (status $(status.fnorm))")

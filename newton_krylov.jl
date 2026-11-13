@@ -144,13 +144,12 @@ struct NKWorkspace
     δ::Vector{Float64}       # Newton step
     x_best::Vector{Float64}
     F_best::Vector{Float64}
-    Fb::Vector{Float64}      # Fjvp!(x): baseline of the low-precision difference
     gmres::GMRESWorkspace
 end
 
 function NKWorkspace(n::Integer, krylov_max::Integer)
     return NKWorkspace(zeros(n), zeros(n), zeros(n), zeros(n), zeros(n), zeros(n),
-        zeros(n), zeros(n), zeros(n), GMRESWorkspace(n, krylov_max))
+        zeros(n), zeros(n), GMRESWorkspace(n, krylov_max))
 end
 
 @doc raw"""
@@ -202,13 +201,13 @@ until the Armijo condition
 holds. If `max_backtrack` halvings do not get there, the residual has hit the
 noise floor of ``F`` and the solve stops.
 
-# Mixed precision
+# A cheaper Jacobian product
 
-`Fjvp!(y, x)`, if given, is a cheaper evaluation of the same residual (the FP32
-pair sum) that the Jacobian products use for both points of the difference, with
-one extra evaluation at ``x_k`` per Newton step. The residual, the line search
-and the stopping test stay on `F!`, so the root is that of `F!` and the solve is
-a defect correction in precision. `n_jvp` counts the calls to `Fjvp!`.
+`Jv!(y, x, u)`, if given, replaces the finite difference of `F!` as the product
+``y \leftarrow J(x)\,u``: a product through a cheaper evaluation of the same map
+(the FP32 pair sum) or an analytic tangent. The residual, the line search and the
+stopping test stay on `F!`, so the root is that of `F!`; with a low-precision
+product the solve is a defect correction in precision. `n_jvp` counts the calls.
 
 # Returns
 
@@ -220,8 +219,8 @@ failed) or `:budget` (`max_evals` reached). On `:stalled`/`:budget`, `x` and
 function newton_krylov!(x::AbstractVector, F!, nk::NKWorkspace;
         tol::Real, max_evals::Integer, fd_h::Real,
         eta_max::Real = 0.9, eta_gamma::Real = 0.9, armijo::Real = 1e-4,
-        max_backtrack::Integer = 8, verbose::Bool = false, Fjvp! = nothing)
-    (; F, Ft, xt, xp, Fp, δ, x_best, F_best, Fb) = nk
+        max_backtrack::Integer = 8, verbose::Bool = false, Jv! = nothing)
+    (; F, Ft, xt, xp, Fp, δ, x_best, F_best) = nk
     n_jvp = 0
     krylov_max = size(nk.gmres.R, 1)
 
@@ -236,17 +235,15 @@ function newton_krylov!(x::AbstractVector, F!, nk::NKWorkspace;
 
     # Matrix-free J u by forward difference about the current x (F holds F(x)).
     function jvp!(y, u)
+        if Jv! !== nothing
+            n_jvp += 1
+            return Jv!(y, x, u)
+        end
         h = fd_h / norm(u)
         @. xp = x + h * u
-        if Fjvp! === nothing
-            F!(Fp, xp)
-            n_evals += 1
-            @. y = (Fp - F) / h
-        else
-            Fjvp!(Fp, xp)
-            n_jvp += 1
-            @. y = (Fp - Fb) / h
-        end
+        F!(Fp, xp)
+        n_evals += 1
+        @. y = (Fp - F) / h
         return y
     end
 
@@ -270,15 +267,9 @@ function newton_krylov!(x::AbstractVector, F!, nk::NKWorkspace;
             η = clamp(η_ew, 0.5 * tol / rnorm, Float64(eta_max))
         end
 
-        # Both points of the difference come from the same low-precision map.
-        if Fjvp! !== nothing
-            Fjvp!(Fb, x)
-            n_jvp += 1
-        end
-
         # Solve J δ = F, then step along -δ.
         k_lin, _ = gmres!(δ, jvp!, F, nk.gmres; rtol = η,
-            itmax = Fjvp! === nothing ? min(krylov_max, budget - 1) : krylov_max)
+            itmax = Jv! === nothing ? min(krylov_max, budget - 1) : krylov_max)
         n_newton += 1
 
         # Backtracking line search on ‖F‖ (Armijo).

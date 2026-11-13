@@ -101,10 +101,15 @@ Base.@kwdef struct SimParameters
     # Legacy relative step h = nk_fd_rel·‖v‖; > 0 overrides nk_fd_h. Only for
     # reproducing the first runs (√eps·‖v‖ ≈ 0.1 in FP32, far too large).
     nk_fd_rel::Float64 = 0.0
-    # true = FP64 residual, finite-difference Jacobian products with the FP32
-    # pair sum (:newton and :gs_nk; needs use_gpu=true, gpu_fp32=false). `iter`
-    # then counts FP64 maps and solver_stats' `inner` the FP32 maps.
-    nk_jvp32::Bool = false
+    # Jacobian product of :newton and :gs_nk (the residual is always FP64):
+    #   :fd     forward difference of the FP64 map (one FP64 pair sum per product)
+    #   :tan32  analytic tangent of the pair sum in FP32 + FD of the O(N) projection
+    #   :tan64  the same with the FP64 tangent kernel
+    #   :fd32   forward difference of the map with the FP32 pair sum (too noisy: the
+    #           probe is below the FP32 resolution of the positions; kept for the record)
+    # With anything but :fd, `iter` counts FP64 maps and solver_stats' `inner` the
+    # products. Landau only; the FP32 variants need use_gpu=true, gpu_fp32=false.
+    nk_jvp::Symbol = :fd
     # Solvers built on GeometricSolvers.jl (gs_solvers.jl, loaded on demand; needs
     # Julia 1.13 and the package in the environment):
     #   :gs_nk       Newton + GMRES with our finite-difference product

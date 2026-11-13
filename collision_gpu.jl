@@ -400,3 +400,131 @@ function compute_collision_metric_gpu!(ws::Workspace, dot_v, A, v_parts, w_parts
     end
     return nothing
 end
+
+# ---- Tangent of the pair sum (nk_jvp = :tan32 | :tan64) ------------------------
+# `compute_collision_tangent!` on the GPU, one kernel for both precisions: the pair
+# math runs in the element type `T` of the device arrays, the slice partials are
+# reduced in FP64. Inputs and output are O(1), so FP32 keeps ~1e-6 relative accuracy
+# whatever the size of the direction.
+
+@inline _rsq(x::Float32) = CUDA.rsqrt(x)
+@inline _rsq(x::Float64) = _rsqrt64(x)
+
+function _landau_tangent_partial!(p1, p2, v1::CuDeviceVector{T}, v2, g1, g2, e1, e2,
+        h1, h2, w, N, S, lo1, hi1, lo2, hi2, guard) where {T}
+    tid = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    tid > N * S && return nothing
+    γ = (tid - 1) % N + 1
+    s = (tid - 1) ÷ N + 1
+    @inbounds begin
+        vγ1 = v1[γ]
+        vγ2 = v2[γ]
+        if vγ1 <= lo1 || vγ1 >= hi1 || vγ2 <= lo2 || vγ2 >= hi2
+            p1[tid] = zero(T)
+            p2[tid] = zero(T)
+            return nothing
+        end
+        chunk = cld(N, S)
+        αlo = (s - 1) * chunk + 1
+        αhi = min(s * chunk, N)
+        Gγ1 = g1[γ]; Gγ2 = g2[γ]
+        Hγ1 = h1[γ]; Hγ2 = h2[γ]
+        Eγ1 = e1[γ]; Eγ2 = e2[γ]
+        acc1 = zero(T)
+        acc2 = zero(T)
+        for α in αlo:αhi
+            vα1 = v1[α]
+            vα2 = v2[α]
+            if vα1 <= lo1 || vα1 >= hi1 || vα2 <= lo2 || vα2 >= hi2
+                continue
+            end
+            d1 = vγ1 - vα1
+            d2 = vγ2 - vα2
+            dist2 = d1 * d1 + d2 * d2
+            dist2 < guard && continue
+            inv = _rsq(dist2)
+            inv2 = inv * inv
+            gg1 = g1[α] - Gγ1
+            gg2 = g2[α] - Gγ2
+            hh1 = h1[α] - Hγ1
+            hh2 = h2[α] - Hγ2
+            ε1 = Eγ1 - e1[α]
+            ε2 = Eγ2 - e2[α]
+            dg = d1 * gg1 + d2 * gg2
+            dε = d1 * ε1 + d2 * ε2
+            εg = ε1 * gg1 + ε2 * gg2
+            dh = (d1 * hh1 + d2 * hh2) * inv2
+            c = T(3) * dg * dε * inv2 - εg
+            sw = w[α] * inv
+            acc1 += sw * (hh1 - d1 * dh + inv2 * (c * d1 - gg1 * dε - ε1 * dg))
+            acc2 += sw * (hh2 - d2 * dh + inv2 * (c * d2 - gg2 * dε - ε2 * dg))
+        end
+        p1[tid] = acc1
+        p2[tid] = acc2
+    end
+    return nothing
+end
+
+struct GpuTangentBuf{T}
+    N::Int
+    v1::CuVector{T}
+    v2::CuVector{T}
+    g1::CuVector{T}
+    g2::CuVector{T}
+    e1::CuVector{T}
+    e2::CuVector{T}
+    h1::CuVector{T}
+    h2::CuVector{T}
+    w::CuVector{T}
+    p1::CuVector{T}
+    p2::CuVector{T}
+    o1::CuVector{Float64}
+    o2::CuVector{Float64}
+    ht::Vector{T}
+    h::Vector{Float64}
+end
+
+const _GPU_TBUF = Dict{DataType, Any}()
+
+function _gpu_tbuf(::Type{T}, N::Int) where {T}
+    b = get(_GPU_TBUF, T, nothing)
+    if b === nothing || b.N != N
+        z() = CUDA.zeros(T, N)
+        b = GpuTangentBuf{T}(N, z(), z(), z(), z(), z(), z(), z(), z(), z(),
+            CUDA.zeros(T, N * _SLICES), CUDA.zeros(T, N * _SLICES),
+            CUDA.zeros(Float64, N), CUDA.zeros(Float64, N), zeros(T, N), zeros(N))
+        _GPU_TBUF[T] = b
+    end
+    return b::GpuTangentBuf{T}
+end
+
+function _collision_tangent_gpu!(::Type{T}, ws::Workspace, out, v_parts, w_parts, G, e,
+        δG) where {T}
+    N = size(v_parts, 1)
+    b = _gpu_tbuf(T, N)
+    for (dst, src) in ((b.v1, v_parts), (b.g1, G), (b.e1, e), (b.h1, δG))
+        _upload_col!(dst, src, 1, b.ht)
+    end
+    for (dst, src) in ((b.v2, v_parts), (b.g2, G), (b.e2, e), (b.h2, δG))
+        _upload_col!(dst, src, 2, b.ht)
+    end
+    copyto!(b.w, T.(w_parts))
+    @cuda threads=_TPB blocks=cld(N * _SLICES, _TPB) _landau_tangent_partial!(
+        b.p1, b.p2, b.v1, b.v2, b.g1, b.g2, b.e1, b.e2, b.h1, b.h2, b.w, N, _SLICES,
+        T(ws.bp1[1]), T(ws.bp1[end]), T(ws.bp2[1]), T(ws.bp2[end]),
+        T === Float32 ? 1.0f-12 : 1e-24)
+    @cuda threads=256 blocks=cld(N, 256) _reduce_partials!(
+        b.o1, b.o2, b.p1, b.p2, N, _SLICES)
+    for (col, src) in ((1, b.o1), (2, b.o2))
+        copyto!(b.h, src)
+        @inbounds for i in 1:N
+            out[i, col] = b.h[i]
+        end
+    end
+    return nothing
+end
+
+compute_collision_tangent_gpu32!(ws::Workspace, out, v, w, G, e, δG) =
+    _collision_tangent_gpu!(Float32, ws, out, v, w, G, e, δG)
+compute_collision_tangent_gpu64!(ws::Workspace, out, v, w, G, e, δG) =
+    _collision_tangent_gpu!(Float64, ws, out, v, w, G, e, δG)

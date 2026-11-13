@@ -155,11 +155,13 @@ function run_simulation(p::SimParameters; resume = nothing)
         p.use_gpu && p.gpu_fp32 &&
             error("solver=$(p.solver) needs the FP64 pair kernel (gpu_fp32=false)")
     end
-    if p.nk_jvp32
-        p.solver in (:newton, :gs_nk) || error("nk_jvp32 needs solver=:newton or :gs_nk")
-        p.collision_model == :landau || error("nk_jvp32 is Landau-only")
-        p.use_gpu && p.gpu_fp32 && error("nk_jvp32 needs the FP64 pair kernel (gpu_fp32=false)")
+    p.nk_jvp in (:fd, :tan32, :tan64, :fd32) || error("unknown nk_jvp=$(p.nk_jvp)")
+    if p.nk_jvp !== :fd
+        p.solver in (:newton, :gs_nk) || error("nk_jvp needs solver=:newton or :gs_nk")
+        p.collision_model == :landau || error("nk_jvp=$(p.nk_jvp) is Landau-only")
+        p.use_gpu && p.gpu_fp32 && error("nk_jvp needs the FP64 pair kernel (gpu_fp32=false)")
     end
+    jw = p.nk_jvp === :fd ? nothing : jvp_workspace(p.N_PARTICLES)
     dc = p.solver in (:defect, :gs_npc) ?
          (A = zeros(p.N_PARTICLES, 3), Gk = zeros(p.N_PARTICLES, 2),
         Φu = zeros(p.N_PARTICLES, 2)) : nothing
@@ -168,11 +170,11 @@ function run_simulation(p::SimParameters; resume = nothing)
     nk = p.solver === :newton ? NKWorkspace(2 * p.N_PARTICLES, p.nk_krylov_max) :
          nothing
     nk_fd_h = p.nk_fd_h > 0 ? p.nk_fd_h :
-              (p.use_gpu && (p.gpu_fp32 || p.nk_jvp32) ? 1e-5 : 1e-6)
+              (p.use_gpu && (p.gpu_fp32 || p.nk_jvp === :fd32) ? 1e-5 : 1e-6)
     gs = is_gs ?
          Base.invokelatest(getglobal(Main, :gs_setup), ws, p, nk_fd_h,
         (; v_mid, dv, dS_mid, G_eff, dot_v, f_buf, r_vec, L_vec, G,
-            Gv, r_curr, r_prev, Gv_prev, v_old_buf, ΔF, ΔG), dc) : nothing
+            Gv, r_curr, r_prev, Gv_prev, v_old_buf, ΔF, ΔG), dc, jw) : nothing
 
     # NN warm start (stateless — resume-safe without checkpoint changes).
     p.warmstart in (:euler, :nn) || error("unknown warmstart=$(p.warmstart)")
@@ -290,7 +292,7 @@ function run_simulation(p::SimParameters; resume = nothing)
                 max_iter = p.max_iter, tol = p.tol, abs_floor = p.abs_floor,
                 fd_h = nk_fd_h, fd_rel = p.nk_fd_rel, eta_max = p.nk_eta_max,
                 use_gonzalez = p.use_gonzalez,
-                exit_picard_step = p.exit_picard_step, jvp32 = p.nk_jvp32,
+                exit_picard_step = p.exit_picard_step, jvp = p.nk_jvp, jw = jw,
                 verbose = (step <= start_step + 3))
         elseif is_gs
             Base.invokelatest(getglobal(Main, :gs_step!), gs, v1, v_particles,
@@ -364,7 +366,7 @@ function run_simulation(p::SimParameters; resume = nothing)
         step % 25 == 0 &&
             println("Step $step/$(p.N_STEPS)  iter=$iter  " *
                     (p.solver === :anderson ? "rs=" :
-                     p.solver === :newton && !p.nk_jvp32 ? "newton=" : "inner=") *
+                     p.solver === :newton && p.nk_jvp === :fd ? "newton=" : "inner=") *
                     "$n_rs" *
                     "  ‖r‖=$(round(res_final; sigdigits=3))" *
                     "  ‖f_s−f_p‖=$(round(fp_l2_history[end]; sigdigits=4))" *
@@ -437,6 +439,8 @@ function enable_gpu!(p::SimParameters)
             COLLMETRIC_FN[] = getglobal(Main, :compute_collision_metric_gpu!)
         end
         COLLISION32_FN[] = getglobal(Main, :compute_collision_gpu32!)
+        COLLTANGENT32_FN[] = getglobal(Main, :compute_collision_tangent_gpu32!)
+        COLLTANGENT64_FN[] = getglobal(Main, :compute_collision_tangent_gpu64!)
     end
     return nothing
 end
