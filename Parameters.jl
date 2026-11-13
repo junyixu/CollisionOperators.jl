@@ -89,6 +89,9 @@ Base.@kwdef struct SimParameters
     dc_eta::Float64 = 0.05         # inner tolerance, relative to the outer residual
     dc_max_inner::Int = 60         # cap on inner maps per outer iteration
     dc_stag_window::Int = 5        # outer iterations between stagnation checks
+    # Cheap inner model of :defect and :gs_npc: :frozen = frozen metric; :tan32 /
+    # :tan64 = tangent of the whole pair sum (FP32 / FP64 kernel), G_eff nonlinear.
+    dc_model::Symbol = :frozen
     # Anderson depth of the outer defect-correction loop; 0 = plain Richardson.
     dc_outer_m::Int = 0
     nk_krylov_max::Int = 30        # GMRES basis size per Newton step

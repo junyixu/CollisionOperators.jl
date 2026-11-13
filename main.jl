@@ -161,7 +161,9 @@ function run_simulation(p::SimParameters; resume = nothing)
         p.collision_model == :landau || error("nk_jvp=$(p.nk_jvp) is Landau-only")
         p.use_gpu && p.gpu_fp32 && error("nk_jvp needs the FP64 pair kernel (gpu_fp32=false)")
     end
-    jw = p.nk_jvp === :fd ? nothing : jvp_workspace(p.N_PARTICLES)
+    p.dc_model in (:frozen, :tan32, :tan64) || error("unknown dc_model=$(p.dc_model)")
+    jw = p.nk_jvp === :fd && p.dc_model === :frozen ? nothing :
+         jvp_workspace(p.N_PARTICLES)
     dc = p.solver in (:defect, :gs_npc) ?
          (A = zeros(p.N_PARTICLES, 3), Gk = zeros(p.N_PARTICLES, 2),
         Φu = zeros(p.N_PARTICLES, 2)) : nothing
@@ -308,6 +310,7 @@ function run_simulation(p::SimParameters; resume = nothing)
                 eta = p.dc_eta, max_inner = p.dc_max_inner,
                 stag_window = p.dc_stag_window, stag_rel_tol = p.stag_rel_tol,
                 use_gonzalez = p.use_gonzalez, outer = dc_outer,
+                model = p.dc_model, jw = jw,
                 verbose = (step <= start_step + 3))
         end
         t_solve = (time_ns() - t_step0) / 1e9

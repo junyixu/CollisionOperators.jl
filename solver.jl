@@ -671,6 +671,18 @@ so momentum and energy are conserved exactly as there. Every `stag_window` outer
 iterations, a best residual that fell by less than `stag_rel_tol` ends the solve with
 the best ``\mathcal{G}(v)``. `max_iter` caps the outer iterations.
 
+`model` selects the cheap map. `:frozen` is ``\Phi_k`` above. `:tan32` and `:tan64` keep
+every first-order term of the pair sum instead of the metric alone,
+
+```math
+\Phi_k(u) = \mathcal{G}(v_k) + \Delta t\, T_k\bigl(\tfrac12 (u - v_k),\; G_\text{eff}(u) - G_\text{eff}(v_k)\bigr) ,
+```
+
+with ``T_k`` the tangent of the pair sum at ``(v_{\text{mid},k}, G_\text{eff}(v_k))``
+([`compute_collision_tangent!`](@ref), FP32 or FP64) and ``G_\text{eff}`` kept nonlinear.
+Each inner map then costs one tangent pair pass on top of ``G_\text{eff}``, the full map
+needs no metric, and `jw` is a [`jvp_workspace`](@ref).
+
 `outer`, a workspace from [`defect_outer_workspace`](@ref), accelerates the outer
 iteration with Anderson on ``v \mapsto N(v)``, where ``N(v)`` is the frozen-metric solve
 from ``v``; `nothing` is the plain Richardson iteration ``v_{k+1} = N(v_k)``.
@@ -686,7 +698,8 @@ function step_defect!(ws::Workspace,
         Gv, r_curr, r_prev, Gv_prev, v_old, ΔF, ΔG, A, Gk, Φu;
         m = 8, max_iter = 2000, tol = 1e-12, abs_floor = 1e-7, damping = 0.7,
         eta = 0.05, max_inner = 60, stag_window = 5, stag_rel_tol = 0.1,
-        use_gonzalez::Bool = true, verbose = false, outer = nothing)
+        use_gonzalez::Bool = true, verbose = false, outer = nothing,
+        model::Symbol = :frozen, jw = nothing)
     N = size(v0, 1)
     nrm0 = 0.0
     nrm_best = Inf
@@ -713,11 +726,31 @@ function step_defect!(ws::Workspace,
         return out
     end
 
+    # The tangent model: Φ_k(u) = 𝒢(v_k) + Δt T_k((u − v_k)/2, G_eff(u) − G_k), T_k the
+    # tangent of the pair sum at (v_mid,k, G_k). jw.xp holds v_k, jw.vmb its midpoint.
+    tangent_fn = model === :tan32 ? COLLTANGENT32_FN[] : COLLTANGENT64_FN[]
+    function tangent_map!(out, u)
+        landau_geff!(ws, G_eff, u, v0, w_parts, S0, v_mid, dv, dS_mid,
+            f_buf, r_vec, L_vec, G_buf; use_gonzalez)
+        @. jw.δG = G_eff - Gk
+        @. jw.e = 0.5 * (u - jw.xp)
+        Base.invokelatest(tangent_fn, ws, jw.T, jw.vmb, w_parts, Gk, jw.e, jw.δG)
+        @. out = Gv + dt * jw.T
+        return out
+    end
+    inner_map! = model === :frozen ? frozen_map! : tangent_map!
+
     o_m > 0 && (outer.has_prev[] = false)
     for k in 1:max_iter
         landau_geff!(ws, G_eff, v1, v0, w_parts, S0, v_mid, dv, dS_mid,
             f_buf, r_vec, L_vec, G_buf; use_gonzalez)
-        Base.invokelatest(COLLMETRIC_FN[], ws, dot_v_buf, A, v_mid, w_parts, G_eff)
+        if model === :frozen
+            Base.invokelatest(COLLMETRIC_FN[], ws, dot_v_buf, A, v_mid, w_parts, G_eff)
+        else
+            Base.invokelatest(COLLISION_FN[], ws, dot_v_buf, v_mid, w_parts, G_eff)
+            jw.vmb .= v_mid
+            jw.xp .= v1
+        end
         @. Gv = v0 + dt * dot_v_buf
         @. r_curr = Gv - v1
         nrm = norm(r_curr)
@@ -743,7 +776,7 @@ function step_defect!(ws::Workspace,
 
         Gk .= G_eff
         o_m > 0 && (outer.x .= v1)
-        n_in = _anderson_inner!(frozen_map!, v1, Φu, r_curr, r_prev, Gv_prev, v_old,
+        n_in = _anderson_inner!(inner_map!, v1, Φu, r_curr, r_prev, Gv_prev, v_old,
             ΔF, ΔG, max(eta * nrm, 0.5 * abs_floor), max_inner, m, damping)
         inner += n_in
         verbose && println("    outer k=$k  ‖r‖=$nrm  inner +$n_in")

@@ -43,7 +43,9 @@ mutable struct GSContext{W, B, D, J}
     S0::Float64
     dt::Float64
     use_gonzalez::Bool
-    with_metric::Bool         # FP64 maps also return the metric A (:gs_npc)
+    with_metric::Bool         # FP64 maps also return the metric A (:gs_npc, frozen)
+    keep_base::Bool           # FP64 maps keep G_eff and v_mid (:gs_npc, any model)
+    model::Symbol             # inner model of :gs_npc (dc_model)
     # last FP64 map: 𝒢(x64) in G64
     x64::Vector{Float64}
     G64::Matrix{Float64}
@@ -71,7 +73,8 @@ mutable struct GSContext{W, B, D, J}
 end
 
 # 𝒢(x) with the FP64 pair sum, uncached, into `out`; with `metric` also A and G_eff.
-function gs_map64!(c::GSContext, out::Matrix{Float64}, x; metric::Bool = false)
+function gs_map64!(c::GSContext, out::Matrix{Float64}, x; metric::Bool = false,
+        base::Bool = false)
     b = c.buf
     X = reshape(x, c.N, 2)
     if metric
@@ -84,6 +87,11 @@ function gs_map64!(c::GSContext, out::Matrix{Float64}, x; metric::Bool = false)
         picard_map!(c.ws, out, X, c.v0, c.w, c.S0, c.dt, b.v_mid, b.dv, b.dS_mid,
             b.G_eff, b.dot_v, b.f_buf, b.r_vec, b.L_vec, b.G;
             use_gonzalez = c.use_gonzalez)
+        if base                 # the base point of the tangent model
+            c.dc.Gk .= b.G_eff
+            c.jw.vmb .= b.v_mid
+            c.jw.xp .= X
+        end
     end
     c.n64 += 1
     return out
@@ -92,7 +100,7 @@ end
 # Make the FP64 cache hold x.
 function gs_full64!(c::GSContext, x)
     c.has64 && x == c.x64 && return nothing
-    gs_map64!(c, c.G64, x; metric = c.with_metric)
+    gs_map64!(c, c.G64, x; metric = c.with_metric, base = c.keep_base)
     copyto!(c.x64, x)
     c.has64 = true
     return nothing
@@ -137,7 +145,7 @@ end
 The frozen-metric solve of [`step_defect!`](@ref) as a nonlinear method of
 GeometricSolvers: one step from `x` returns ``N(x)``, the fixed point of the cheap map
 ``\\Phi_x(u) = \\mathcal{G}(x) - \\Delta t\\, A_x (G_\\text{eff}(u) - G_\\text{eff}(x))``
-found by Anderson to the tolerance `eta` relative to ``\\lVert\\mathcal{G}(x) - x\\rVert``.
+(or of the tangent model, `dc_model`) found by Anderson to the tolerance `eta` relative to ``\\lVert\\mathcal{G}(x) - x\\rVert``.
 It is meant as the `inner` of `LeftPreconditioned`, which reads only the iterate the
 step returns, so the step does not evaluate the global residual at ``N(x)``.
 """
@@ -184,9 +192,21 @@ function gs_frozen_solve!(c::GSContext, out, x)
         return o
     end
 
+    tangent_fn = c.model === :tan32 ? COLLTANGENT32_FN[] : COLLTANGENT64_FN[]
+    jw = c.jw
+    function tangent_map!(o, u)
+        landau_geff!(c.ws, b.G_eff, u, c.v0, c.w, c.S0, b.v_mid, b.dv, b.dS_mid,
+            b.f_buf, b.r_vec, b.L_vec, b.G; use_gonzalez = c.use_gonzalez)
+        @. jw.δG = b.G_eff - Gk
+        @. jw.e = 0.5 * (u - jw.xp)
+        Base.invokelatest(tangent_fn, c.ws, jw.T, jw.vmb, c.w, Gk, jw.e, jw.δG)
+        @. o = Gv + dt * jw.T
+        return o
+    end
+
     u = c.uN
     copyto!(u, x)
-    c.n_inner += _anderson_inner!(frozen_map!, u, dc.Φu, b.r_curr, b.r_prev, b.Gv_prev,
+    c.n_inner += _anderson_inner!(c.model === :frozen ? frozen_map! : tangent_map!, u, dc.Φu, b.r_curr, b.r_prev, b.Gv_prev,
         b.v_old_buf, b.ΔF, b.ΔG, max(c.eta * nrm, 0.5 * c.abs_floor), c.max_inner,
         c.m_inner, c.damping)
     copyto!(c.xN, x)
@@ -208,8 +228,9 @@ function gs_setup(ws, p, fd_h, buf, dc, jw)
     N = p.N_PARTICLES
     z() = zeros(2N)
     Z() = zeros(N, 2)
+    npc = p.solver === :gs_npc
     c = GSContext(ws, N, buf, dc, Z(), zeros(N), 0.0, p.DT, p.use_gonzalez,
-        p.solver === :gs_npc,
+        npc && p.dc_model === :frozen, npc && p.dc_model !== :frozen, p.dc_model,
         z(), Z(), false, z(), Z(), jw, z(), Z(), false,
         0, 0, 0, 0.0,
         p.nk_jvp, fd_h, p.dc_eta, p.dc_max_inner, p.m_anderson, p.damping, p.abs_floor)
